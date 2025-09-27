@@ -4,6 +4,7 @@ from datetime import datetime
 from urllib.parse import urlencode
 
 from agents.coordinator import Coordinator
+from core.utils import load_history
 
 st.set_page_config(page_title="HurriAid", layout="wide")
 
@@ -12,17 +13,11 @@ st.sidebar.title("HurriAid")
 zip_code = st.sidebar.text_input("Enter ZIP code", value="33101", key="zip_input")
 offline_mode = st.sidebar.toggle("Offline Mode", value=True, key="offline_toggle")
 update_now = st.sidebar.button("Update Now")
-
-# Explicit enable/disable for ADK (default: enabled)
-use_adk_enabled = st.sidebar.toggle(
-    "Use Google ADK",
-    value=True,
-    help="Enable or Disable use of Google ADK"
-)
+use_adk_enabled = st.sidebar.toggle("Use Google ADK", value=True, help="Enable or Disable use of Google ADK")
 
 # Optional auto‑refresh
 autorefresh_on = st.sidebar.toggle("Auto Refresh", value=False, help="Continuously re‑run to simulate a loop.", key="auto_refresh_toggle")
-interval_sec = st.sidebar.slider("Refresh every (seconds)", 5, 60, 15, key="auto_refresh_interval")
+interval_sec = st.sidebar.slider("Refresh every second", 5, 60, 15, key="auto_refresh_interval")
 if autorefresh_on:
     try:
         from streamlit_autorefresh import st_autorefresh
@@ -36,37 +31,47 @@ if ("coordinator" not in st.session_state) or (st.session_state.get("use_adk_ena
     st.session_state.use_adk_enabled = use_adk_enabled
 coord = st.session_state.coordinator
 
+# Preload persisted history
+if "persisted_history" not in st.session_state:
+    st.session_state.persisted_history = load_history()
+
 # Change detection
 zip_changed = (st.session_state.get("last_zip") != zip_code)
+mode_changed = (st.session_state.get("last_offline") != offline_mode)
 
 # --- Header ---
 st.title("HurriAid")
 st.write(f"Last opened: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # --- Run ---
-should_run = ("last_result" not in st.session_state) or update_now or autorefresh_on or zip_changed
+should_run = ("last_result" not in st.session_state) or update_now or autorefresh_on or zip_changed or mode_changed
 if should_run:
-    result = coord.run_once(zip_code)
+    result = coord.run_once(zip_code, offline=offline_mode)
     st.session_state.last_result = result
     st.session_state.last_zip = zip_code
+    st.session_state.last_offline = offline_mode
     st.session_state.last_run = datetime.now().strftime('%H:%M:%S')
-    # Append to history
+    # Append to session history table
     hist = st.session_state.get("history", [])
     hist.append({
         "time": st.session_state.last_run,
         "zip": zip_code,
         "risk": (result.get("analysis") or {}).get("risk", "—"),
         "eta": (result.get("plan") or {}).get("eta_min", "—"),
+        "mode": "Offline" if offline_mode else "Online"
     })
-    st.session_state.history = hist[-12:]  # keep last 12 runs
+    st.session_state.history = hist[-12:]
 
 result = st.session_state.get("last_result", {})
 advisory = result.get("advisory", {})
 analysis = result.get("analysis", {})
 plan = result.get("plan")
 checklist = result.get("checklist", [])
+verify = result.get("verify", {})
 timings = result.get("timings_ms", {})
 errors = result.get("errors", {})
+zip_valid = result.get("zip_valid", True)
+zip_message = result.get("zip_message", "")
 
 # --- Metrics ---
 col1, col2, col3, col4 = st.columns(4)
@@ -82,11 +87,14 @@ with col4:
 # --- Panels ---
 st.subheader("Advisory")
 if advisory:
-    st.json(advisory)
+        st.json(advisory)
 else:
     st.info("Advisory data unavailable.")
 
+
 st.subheader("Risk")
+if not zip_valid and zip_message:
+    st.warning(zip_message)
 if analysis:
     if "distance_km" in analysis:
         st.write(
@@ -95,6 +103,7 @@ if analysis:
     st.caption(analysis.get("reason", ""))
 else:
     st.info("Risk analysis unavailable.")
+
 
 st.subheader("Route")
 if plan:
@@ -105,11 +114,24 @@ if plan:
 else:
     st.info("No open shelters found.")
 
+
 st.subheader("Checklist (Risk‑aware)")
 if checklist:
     st.write("\n".join(f"- {it}" for it in checklist))
 else:
     st.write("- Water (3 days)\n- Non-perishable food\n- Medications\n- Flashlight & batteries\n- First aid kit\n- Important documents in a waterproof bag")
+
+
+st.subheader("Verifier (Rumor Check)")
+overall = verify.get("overall", "CLEAR")
+matches = verify.get("matches", [])
+if overall == "CLEAR" and not matches:
+    st.success("No rumor flags detected in the current checklist.")
+else:
+    st.warning(f"Verifier result: {overall}")
+    for m in matches:
+        st.write(f"- Pattern: **{m['pattern']}** → {m['verdict']} — {m.get('note', '')}")
+
 
 st.subheader("Agent Status")
 status_lines = [
@@ -121,9 +143,10 @@ status_lines = [
 ]
 st.code("\n".join(status_lines), language="text")
 
-st.subheader("Run History")
+
+st.subheader("History")
 hist = st.session_state.get("history", [])
 if hist:
     st.table(hist)
 else:
-    st.caption("No runs yet.")
+    st.caption("No session runs yet.")
