@@ -1,0 +1,5 @@
+[
+{ "name": "Miami Central High Gym", "lat": 25.835, "lon": -80.230, "is_open": true },
+{ "name": "Coconut Grove Rec Center", "lat": 25.727, "lon": -80.244, "is_open": true },
+{ "name": "Ft. Lauderdale HS Cafeteria", "lat": 26.141, "lon": -80.136, "is_open": false }
+]
