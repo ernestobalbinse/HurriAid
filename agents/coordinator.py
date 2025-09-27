@@ -1,74 +1,63 @@
 from __future__ import annotations
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from time import perf_counter
+from email import errors
 from typing import Dict, Any
+from time import perf_counter
 
 
 from agents.watcher import Watcher
 from agents.analyzer import assess_risk
 from agents.planner import nearest_open_shelter
-
+from agents.communicator import build_checklist
+from core.parallel_exec import ParallelRunner
 
 class Coordinator:
-	def __init__(self, data_dir: str = "data", max_workers: int = 3):
-		self.watcher = Watcher(data_dir=data_dir)
-		self.max_workers = max_workers
+    def __init__(self, data_dir: str = "data", use_adk_preferred: bool = True):
+        self.watcher = Watcher(data_dir=data_dir)
+        self.runner = ParallelRunner(use_adk_preferred=use_adk_preferred)
 
-	def run_once(self, zip_code: str) -> Dict[str, Any]:
-		t0 = perf_counter()
-		timings = {}
-		errors = {}
+    def run_once(self, zip_code: str) -> Dict[str, Any]:
+        timings = {}
+        errors = {}
 
-		# 1) Fan‑out: load static data synchronously (fast/local), then run compute agents in parallel
-		try:
-			t = perf_counter()
-			advisory = self.watcher.get_advisory()
-			zip_centroids = self.watcher.get_zip_centroids()
-			shelters = self.watcher.get_shelters()
-			timings["watcher_ms"] = round((perf_counter() - t) * 1000)
-		except Exception as e:
-			errors["watcher"] = str(e)
-			advisory, zip_centroids, shelters = {}, {}, []
+        # Load data (local/fast)
+        t0 = perf_counter()
+        try:
+            advisory = self.watcher.get_advisory()
+            zip_centroids = self.watcher.get_zip_centroids()
+            shelters = self.watcher.get_shelters()
+        except Exception as e:
+            advisory, zip_centroids, shelters = {}, {}, []
+            errors["watcher"] = str(e)
+        timings["watcher_ms"] = round((perf_counter() - t0) * 1000)
 
-		analysis = None
-		plan = None
+        # Prepare parallel tasks
+        def _analyze():
+            return assess_risk(zip_code, advisory, zip_centroids)
 
-		# 2) Parallel run of Analyzer + Planner
-		def _run_analyzer():
-			t = perf_counter()
-			try:
-				res = assess_risk(zip_code, advisory, zip_centroids)
-				return ("analyzer", res, round((perf_counter() - t) * 1000), None)
-			except Exception as e:
-				return ("analyzer", None, round((perf_counter() - t) * 1000), str(e))
 
-		def _run_planner():
-			t = perf_counter()
-			try:
-				res = nearest_open_shelter(zip_code, zip_centroids, shelters)
-				return ("planner", res, round((perf_counter() - t) * 1000), None)
-			except Exception as e:
-				return ("planner", None, round((perf_counter() - t) * 1000), str(e))
+        def _plan():
+            return nearest_open_shelter(zip_code, zip_centroids, shelters)
 
-		with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
-			futures = [ex.submit(_run_analyzer), ex.submit(_run_planner)]
-			for fut in as_completed(futures):
-				name, res, ms, err = fut.result()
-				timings[f"{name}_ms"] = ms
-				if err:
-					errors[name] = err
-				else:
-					if name == "analyzer":
-						analysis = res
-					elif name == "planner":
-						plan = res
 
-		timings["total_ms"] = round((perf_counter() - t0) * 1000)
+        results, par_timings, par_errors = self.runner.run({
+            "analyzer": _analyze,
+            "planner": _plan,
+        })
 
-		return {
-			"advisory": advisory,
-			"analysis": analysis,
-			"plan": plan,
-			"timings_ms": timings,
-			"errors": errors,
-		}
+        analysis = results.get("analyzer")
+        plan = results.get("planner")
+        checklist = build_checklist(analysis)
+
+
+        timings.update(par_timings)
+        errors.update(par_errors)
+
+
+        return {
+            "advisory": advisory,
+            "analysis": analysis,
+            "plan": plan,
+            "checklist": checklist,
+            "timings_ms": timings,
+            "errors": errors,
+        }
