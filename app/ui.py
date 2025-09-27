@@ -62,9 +62,9 @@ update_now = st.sidebar.button(
 # --- Live Watcher (ALWAYS ON) ---
 st.sidebar.markdown("### Live Watcher")
 live_interval_sec = st.sidebar.slider(
-    "Poll advisories every (seconds)",
+    "Update storm info every (seconds)",
     5, 300, 30,
-    help="Continuously checks advisories and re-runs Analyzer + Planner.",
+    help="Continuously loops and updates storm info, re-running analyisis and planner.",
     key=f"{APP_NS}_live_interval",
 )
 
@@ -73,7 +73,6 @@ live_count = None
 try:
     from streamlit_autorefresh import st_autorefresh  # pip install streamlit-autorefresh
     live_count = st_autorefresh(interval=live_interval_sec * 1000, key=f"{APP_NS}_live_loop")
-    st.sidebar.caption(f"Live Watcher running (tick #{live_count or 0})")
 except Exception:
     st.sidebar.warning("Live Watcher needs 'streamlit-autorefresh'. Run: pip install streamlit-autorefresh")
 
