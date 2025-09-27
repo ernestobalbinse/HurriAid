@@ -1,6 +1,7 @@
 import streamlit as st
 from datetime import datetime
 from urllib.parse import urlencode
+from streamlit_autorefresh import st_autorefresh
 
 
 from agents.coordinator import Coordinator
@@ -25,7 +26,11 @@ interval_sec = st.sidebar.slider("Refresh every (seconds)", 5, 60, 15, key="auto
 
 
 if autorefresh_on:
-    st.autorefresh(interval=interval_sec * 1000, key="hurri_loop")
+    try:
+        from streamlit_autorefresh import st_autorefresh # pip install streamlit-autorefresh
+        st_autorefresh(interval=interval_sec * 1000, key="hurri_loop")
+    except Exception:
+        st.warning("Auto Refresh requires 'streamlit-autorefresh'. Run: pip install streamlit-autorefresh")
 
 # --- Coordinator bootstrap ---
 if "coordinator" not in st.session_state:
