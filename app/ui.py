@@ -1,4 +1,4 @@
-# app/ui.py — AI Studio by default (no billing), optional Vertex if explicitly enabled
+# app/ui.py — Live Watcher + Demo Mode + AI Studio default (Vertex optional)
 import os
 import streamlit as st
 from datetime import datetime
@@ -34,56 +34,32 @@ else:
         st.caption("Ensure billing is enabled, Vertex AI API is ON, and credentials/roles are configured.")
         st.stop()
 
-# ---------------- Imports that rely on your project modules ----------------
+# ---------------- Project imports ----------------
 from core.parallel_exec import ADKNotAvailable
 import pydeck as pdk
 from tools.geo import circle_polygon
 from core.utils import load_history
 from core.ui_helpers import badge, compute_freshness
 from agents.coordinator import Coordinator
-from agents.verifier_llm import verify_items_with_llm  # <- interactive LLM tab uses this
+from agents.verifier_llm import verify_items_with_llm  # interactive LLM tab uses this
 
 st.set_page_config(page_title="HurriAid", layout="wide")
+APP_NS = "v9"  # bump namespace to avoid stale widget state
 
-# ---------------- Sidebar (single block, unique keys) ----------------
-APP_NS = "v8"  # namespace for widget keys
+# ───────────────────────── Sidebar ─────────────────────────
+st.sidebar.subheader("Input")
+zip_code = st.sidebar.text_input("Enter ZIP code", value="33101", key=f"{APP_NS}_zip")
 
-zip_code = st.sidebar.text_input(
-    "Enter ZIP code",
-    value="33101",
-    key=f"{APP_NS}_zip",
-)
+# Manual update
+update_now = st.sidebar.button("Update Now", key=f"{APP_NS}_update")
 
-update_now = st.sidebar.button(
-    "Update Now",
-    key=f"{APP_NS}_update",
-)
-
-autorefresh_on = st.sidebar.toggle(
-    "Auto Refresh",
-    value=False,
-    help="Continuously re-run to simulate a loop.",
-    key=f"{APP_NS}_autorefresh",
-)
-interval_sec = st.sidebar.slider(
-    "Refresh every (seconds)",
-    5, 60, 15,
-    key=f"{APP_NS}_autorefresh_interval",
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Settings")
-show_map = st.sidebar.toggle("Show Map", value=True, key=f"{APP_NS}_show_map")
-show_verifier = st.sidebar.toggle("Show Verifier", value=True, key=f"{APP_NS}_show_verifier")
-show_history = st.sidebar.toggle("Show History", value=True, key=f"{APP_NS}_show_history")
-
-# --- Demo Mode (sidebar) ---
+# Demo Mode (under Update Now)
 st.sidebar.markdown("---")
 st.sidebar.subheader("Demo Mode")
 demo_mode = st.sidebar.toggle(
-    "Demo Mode",
+    "Enable Demo Mode",
     value=False,
-    help="Cycles ZIPs automatically",
+    help="Cycles through demo ZIPs automatically.",
     key=f"{APP_NS}_demo_mode",
 )
 demo_interval = st.sidebar.slider(
@@ -94,27 +70,54 @@ demo_interval = st.sidebar.slider(
 DEFAULT_DEMO_ZIPS = ["33101", "33012", "33301", "33401"]
 demo_zips = DEFAULT_DEMO_ZIPS
 
-if "demo_idx" not in st.session_state:
-    st.session_state.demo_idx = 0
+# Live Watcher controls
+st.sidebar.markdown("---")
+st.sidebar.subheader("Live Watcher")
+live_on = st.sidebar.toggle(
+    "Enable Live Watcher",
+    value=False,
+    help="Poll advisories every N minutes and auto-run when risk changes.",
+    key=f"{APP_NS}_live_on",
+)
+live_every_min = st.sidebar.slider(
+    "Poll every (minutes)",
+    1, 30, 5,
+    key=f"{APP_NS}_live_every_min",
+)
 
+# View toggles
+st.sidebar.markdown("---")
+st.sidebar.subheader("View")
+show_map = st.sidebar.toggle("Show Map", value=True, key=f"{APP_NS}_show_map")
+show_verifier = st.sidebar.toggle("Show Verifier", value=True, key=f"{APP_NS}_show_verifier")
+show_history = st.sidebar.toggle("Show History", value=True, key=f"{APP_NS}_show_history")
+
+# ───────────────────── Demo & Live timers ─────────────────────
+# Autorefresh for Demo Mode
 if demo_mode:
     try:
         from streamlit_autorefresh import st_autorefresh
-        count = st_autorefresh(interval=demo_interval * 1000, key=f"{APP_NS}_demo_loop")
-        if count is not None:
+        count_demo = st_autorefresh(interval=demo_interval * 1000, key=f"{APP_NS}_demo_tick")
+        # Keep an index in session
+        if "demo_idx" not in st.session_state:
+            st.session_state.demo_idx = 0
+        if count_demo is not None:
             st.session_state.demo_idx = (st.session_state.demo_idx + 1) % len(demo_zips)
             zip_code = demo_zips[st.session_state.demo_idx]
+            # Keep the textbox in sync with the demo ZIP
+            st.session_state[f"{APP_NS}_zip"] = zip_code
     except Exception:
         st.warning("Demo Mode needs 'streamlit-autorefresh'. Run: pip install streamlit-autorefresh")
 
-if autorefresh_on:
+# Autorefresh for Live Watcher
+if live_on:
     try:
         from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=interval_sec * 1000, key=f"{APP_NS}_loop")
+        st_autorefresh(interval=live_every_min * 60 * 1000, key=f"{APP_NS}_live_tick")
     except Exception:
-        st.warning("Auto Refresh requires 'streamlit-autorefresh'. Run: pip install streamlit-autorefresh")
+        st.warning("Live Watcher needs 'streamlit-autorefresh'. Run: pip install streamlit-autorefresh")
 
-# ---------------- Coordinator (ADK mandatory) ----------------
+# ───────────────────── Coordinator / ADK ─────────────────────
 if "coordinator" not in st.session_state:
     try:
         st.session_state.coordinator = Coordinator(data_dir="data")
@@ -122,48 +125,81 @@ if "coordinator" not in st.session_state:
     except ADKNotAvailable as e:
         st.session_state.coordinator = None
         st.session_state.adk_error = str(e)
-
 coord = st.session_state.coordinator
 
-# If ADK broke during init, show blocking banner and stop
 if st.session_state.get("adk_error"):
     st.error("Google ADK is required: " + st.session_state["adk_error"])
     st.stop()
 
-# ---------------- Persisted history ----------------
+# History bootstrap
 if "persisted_history" not in st.session_state:
     try:
         st.session_state.persisted_history = load_history()
     except Exception:
         st.session_state.persisted_history = []
+if "history" not in st.session_state:
+    st.session_state["history"] = []
+if "live_prev_risk" not in st.session_state:
+    st.session_state["live_prev_risk"] = None
+if "last_result" not in st.session_state:
+    st.session_state["last_result"] = {}
+if "last_zip" not in st.session_state:
+    st.session_state["last_zip"] = zip_code
 
-# ---------------- Run triggers ----------------
+# ───────────── Run logic (Manual / Demo / Live) ─────────────
 zip_changed = (st.session_state.get("last_zip") != zip_code)
-should_run = ("last_result" not in st.session_state) or update_now or autorefresh_on or zip_changed
 
-if should_run:
-    if coord is None:
-        st.error("Coordinator not available (ADK error).")
-        st.stop()
-    result = coord.run_once(zip_code)
-    st.session_state.last_result = result
-    st.session_state.last_zip = zip_code
-    st.session_state.last_run = datetime.now().strftime("%H:%M:%S")
-
-    # History row
+def _record_history(result: dict, trigger: str):
     hist = st.session_state.get("history", [])
-    adk_ok = not st.session_state.get("adk_error")
     hist.append({
-        "time": st.session_state.last_run,
+        "time": datetime.now().strftime("%H:%M:%S"),
         "zip": zip_code,
         "risk": (result.get("analysis") or {}).get("risk", "—"),
         "eta": (result.get("plan") or {}).get("eta_min", "—"),
-        "llm": "AI Studio" if not USE_VERTEX else "Vertex",
-        "adk": "ON" if adk_ok else "ERROR",
+        "trigger": trigger,
     })
     st.session_state["history"] = hist[-12:]
 
-# ---------------- Unpack result ----------------
+if live_on:
+    if coord is None:
+        st.error("Coordinator not available (ADK error).")
+        st.stop()
+
+    prev = st.session_state.get("live_prev_risk")
+    live_result = coord.run_if_risk_changed(zip_code, prev_risk=prev)
+
+    # Update prev_risk each tick
+    current_risk = (live_result.get("analysis") or {}).get("risk")
+    st.session_state["live_prev_risk"] = current_risk
+    st.session_state["last_zip"] = zip_code
+
+    # If risk changed, persist full fan-out result
+    if live_result.get("changed"):
+        st.session_state["last_result"] = live_result
+        st.session_state["last_run"] = datetime.now().strftime("%H:%M:%S")
+        _record_history(live_result, trigger="risk-change")
+        st.success(f"Risk changed → auto-ran agents (now: {current_risk}).")
+    elif update_now or zip_changed or demo_mode:
+        # Allow manual/zip-change/demo to render latest probe even if no change
+        st.session_state["last_result"] = live_result
+        st.session_state["last_run"] = datetime.now().strftime("%H:%M:%S")
+        src = "manual" if update_now else ("zip-change" if zip_changed else "demo")
+        _record_history(live_result, trigger=src)
+else:
+    # Classic one-shot mode
+    should_run = ("last_result" not in st.session_state) or update_now or zip_changed or demo_mode
+    if should_run:
+        if coord is None:
+            st.error("Coordinator not available (ADK error).")
+            st.stop()
+        result = coord.run_once(zip_code)
+        st.session_state["last_result"] = result
+        st.session_state["last_zip"] = zip_code
+        st.session_state["last_run"] = datetime.now().strftime("%H:%M:%S")
+        src = "manual" if update_now else ("zip-change" if zip_changed else ("demo" if demo_mode else "auto"))
+        _record_history(result, trigger=src)
+
+# ───────────────────── Unpack result ─────────────────────
 result = st.session_state.get("last_result", {}) or {}
 advisory = result.get("advisory", {}) or {}
 analysis = result.get("analysis", {}) or {}
@@ -174,16 +210,14 @@ timings = result.get("timings_ms", {}) or {}
 errors = result.get("errors", {}) or {}
 zip_point = result.get("zip_point")
 
-# If ADK exploded during run, block the page (mandatory ADK policy)
 if errors.get("adk"):
     st.error("Google ADK is required: " + errors["adk"])
     st.stop()
 
-# ---------------- Header ----------------
+# ───────────────────── Header / Chips ─────────────────────
 st.title("HurriAid")
 st.write(f"Last opened: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# ---------------- Status chips ----------------
 chips = []
 risk_val = (analysis or {}).get("risk", "—")
 if risk_val == "HIGH":
@@ -206,22 +240,16 @@ elif fresh_status == "STALE":
 else:
     chips.append(badge("FRESHNESS: unknown", "gray"))
 
-# LLM backend chip
-chips.append(badge("LLM: Google AI Studio" if not USE_VERTEX else "LLM: Vertex", "green" if not USE_VERTEX else "amber"))
+chips.append(badge("LLM: Google AI Studio" if not USE_VERTEX else "LLM: Vertex",
+                   "green" if not USE_VERTEX else "amber"))
 st.markdown(" ".join(chips), unsafe_allow_html=True)
 
-# ---------------- Error banners from agents ----------------
-if errors:
-    if errors.get("watcher"):
-        st.error(f"Watcher error: {errors['watcher']}")
-    if errors.get("analyzer"):
-        st.error(f"Analyzer error: {errors['analyzer']}")
-    if errors.get("planner"):
-        st.error(f"Planner error: {errors['planner']}")
-    if errors.get("adk"):
-        st.error(f"ADK error: {errors['adk']}")
+# Errors
+if errors.get("watcher"):  st.error(f"Watcher error: {errors['watcher']}")
+if errors.get("analyzer"): st.error(f"Analyzer error: {errors['analyzer']}")
+if errors.get("planner"):  st.error(f"Planner error: {errors['planner']}")
 
-# ---------------- Panels ----------------
+# ───────────────────── Panels ─────────────────────
 # Advisory
 st.subheader("Advisory")
 if advisory:
@@ -333,7 +361,7 @@ else:
         "- Important documents in a waterproof bag"
     )
 
-# ---- Verifier (Rumor Check) — LLM (ADK) only, no default items until user runs ----
+# Verifier (Rumor Check) — LLM only (no defaults shown until user runs)
 verifier_box = st.container()
 if show_verifier:
     with verifier_box:
@@ -392,11 +420,10 @@ if show_verifier:
             # Only show results after the user runs a check
             llm_live = st.session_state.get(LLM_RESULT_KEY)
 
-            # Guard: nothing checked yet OR bad type
             if not isinstance(llm_live, dict) or not llm_live:
                 st.info("Enter rumor text above and click **Check with LLM**.")
             else:
-                # Friendly display mapping + de-shout helper
+                # Friendly verdict labels + de-shout helper
                 VERDICT_LABELS = {
                     "TRUE": "True", "FALSE": "False", "MISLEADING": "Misleading",
                     "CAUTION": "Caution", "CLEAR": "Clear", "ERROR": "Error", "SAFE": "Safe",
@@ -409,8 +436,7 @@ if show_verifier:
 
                 overall_raw = (llm_live.get("overall") or "CLEAR")
                 overall = overall_raw.upper()
-                matches = llm_live.get("matches", [])
-
+                matches = llm_live.get("matches", []) or []
                 overall_display = VERDICT_LABELS.get(overall, overall_raw.title())
 
                 if overall == "ERROR":
@@ -427,28 +453,22 @@ if show_verifier:
                 elif overall == "SAFE":
                     st.success(f"Verifier result: {overall_display}")
                     for m in matches:
-                        verdict = VERDICT_LABELS.get(str(m.get("verdict","")).upper(), str(m.get("verdict","")).title())
-                        note = de_shout(m.get("note",""))
-                        st.markdown(f"- **Rumor:** {m['pattern']} — {m.get('note','')}")
+                        note = de_shout(m.get("note", ""))
+                        st.markdown(f"- **Rumor:** {m['pattern']} — {note}")
                 elif overall == "FALSE":
                     st.error(f"Verifier result: {overall_display}")
                     for m in matches:
-                        verdict = VERDICT_LABELS.get(str(m.get("verdict","")).upper(), str(m.get("verdict","")).title())
-                        note = de_shout(m.get("note",""))
-                        st.markdown(f"- **Rumor:** {m['pattern']} — {m.get('note','')}")
+                        note = de_shout(m.get("note", ""))
+                        st.markdown(f"- **Rumor:** {m['pattern']} — {note}")
                 else:
                     st.warning(f"Verifier result: {overall_display}")
                     for m in matches:
-                        verdict = VERDICT_LABELS.get(str(m.get("verdict","")).upper(), str(m.get("verdict","")).title())
-                        note = de_shout(m.get("note",""))
-                        st.markdown(f"- **Rumor:** {m['pattern']} — {m.get('note','')}")
-
-
+                        note = de_shout(m.get("note", ""))
+                        st.markdown(f"- **Rumor:** {m['pattern']} — {note}")
 else:
     verifier_box.empty()
 
-
-# Agent Status
+# ───────────────── Agent Status & History ─────────────────
 st.subheader("Agent Status")
 status_lines = [
     f"Watcher: {timings.get('watcher_ms', '—')} ms" + (f" | ERROR: {errors['watcher']}" if 'watcher' in errors else ""),
@@ -459,7 +479,6 @@ status_lines = [
 ]
 st.code("\n".join(status_lines), language="text")
 
-# History
 if show_history:
     st.subheader("History")
     hist = st.session_state.get("history", [])
