@@ -8,6 +8,7 @@ import streamlit as st
 st.set_page_config(page_title="HurriAid", layout="wide", initial_sidebar_state="expanded")
 import pydeck as pdk
 from streamlit_autorefresh import st_autorefresh
+import pandas as pd
 
 # ---- Project modules ----
 from core.parallel_exec import ADKNotAvailable
@@ -34,35 +35,35 @@ if not os.getenv("GOOGLE_API_KEY"):
     )
     st.stop()
 
+# --- Layout tightening CSS (reduce top padding) ---
 st.markdown("""
 <style>
-/* reduce the big empty space at the very top */
 .block-container { padding-top: 0.6rem; }
-
-/* (optional) shrink Streamlit's top header bar height */
 header[data-testid="stHeader"] { height: 40px; }
 header[data-testid="stHeader"] > div { height: 40px; }
-
-/* slightly tighter section headings */
 h2, h3 { margin-top: .6rem; margin-bottom: .4rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------- Sidebar (single block, unique keys) ----------------
+# ---------------- Sidebar ----------------
 APP_NS = "v8"  # namespace for widget keys
 
 zip_code = st.sidebar.text_input("Enter ZIP code", value="33101", key=f"{APP_NS}_zip")
-
 update_now = st.sidebar.button("Update Now", key=f"{APP_NS}_update")
 
 # Live Watcher (always on) above Demo Mode
 st.sidebar.markdown("---")
 st.sidebar.subheader("Live Watcher")
 watch_interval = st.sidebar.slider(
-    "Check storm data every (seconds)", 5, 120, 20, key=f"{APP_NS}_watch_interval"
+    "Check storm data every (seconds)", 10, 300, 60, key=f"{APP_NS}_watch_interval"
 )
-st_autorefresh(interval=watch_interval * 1000, key=f"{APP_NS}_watch_loop")
+# Use counters so we only run when the counter increments (not every render)
+watch_count = st_autorefresh(interval=watch_interval * 1000, key=f"{APP_NS}_watch_loop")
+prev_watch_count = st.session_state.get(f"{APP_NS}_prev_watch_count")
+watch_tick = (watch_count is not None) and (prev_watch_count is not None) and (watch_count != prev_watch_count)
+st.session_state[f"{APP_NS}_prev_watch_count"] = watch_count
 
+# Demo Mode
 st.sidebar.markdown("---")
 st.sidebar.subheader("Demo Mode")
 demo_mode = st.sidebar.toggle(
@@ -74,21 +75,27 @@ demo_interval = st.sidebar.slider(
 DEFAULT_DEMO_ZIPS = ["33101", "33012", "33301", "33401"]
 demo_zips = DEFAULT_DEMO_ZIPS
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Settings")
-show_map = st.sidebar.toggle("Show Map", value=True, key=f"{APP_NS}_show_map")
-show_verifier = st.sidebar.toggle("Show Verifier", value=True, key=f"{APP_NS}_show_verifier")
-
-# --- Demo index & behavior ---
+demo_count = None
+demo_tick = False
 if "demo_idx" not in st.session_state:
     st.session_state.demo_idx = 0
 
 if demo_mode:
-    count = st_autorefresh(interval=demo_interval * 1000, key=f"{APP_NS}_demo_loop")
-    if count is not None:
+    demo_count = st_autorefresh(interval=demo_interval * 1000, key=f"{APP_NS}_demo_loop")
+    prev_demo_count = st.session_state.get(f"{APP_NS}_prev_demo_count")
+    demo_tick = (demo_count is not None) and (prev_demo_count is not None) and (demo_count != prev_demo_count)
+    st.session_state[f"{APP_NS}_prev_demo_count"] = demo_count
+
+    if demo_tick:
         st.session_state.demo_idx = (st.session_state.demo_idx + 1) % len(demo_zips)
         zip_code = demo_zips[st.session_state.demo_idx]
         st.session_state[f"{APP_NS}_zip"] = zip_code  # keep input in sync
+
+# Settings
+st.sidebar.markdown("---")
+st.sidebar.subheader("Settings")
+show_map = st.sidebar.toggle("Show Map", value=True, key=f"{APP_NS}_show_map")
+show_verifier = st.sidebar.toggle("Show Verifier", value=True, key=f"{APP_NS}_show_verifier")
 
 # ---------------- Coordinator (ADK mandatory) ----------------
 if "coordinator" not in st.session_state:
@@ -113,14 +120,22 @@ if "persisted_history" not in st.session_state:
     except Exception:
         st.session_state.persisted_history = []
 
-# ---------------- Run triggers ----------------
+# ---------------- Run triggers (only when something really changed) ----------------
 zip_changed = (st.session_state.get("last_zip") != zip_code)
-should_run = ("last_result" not in st.session_state) or update_now or zip_changed or demo_mode
+first_render = ("last_result" not in st.session_state)
+
+# Avoid double-run on the very first render if autorefresh counters are also initialized
+if first_render:
+    watch_tick = False
+    demo_tick = False
+
+should_run = first_render or update_now or zip_changed or watch_tick or demo_tick
 
 if should_run:
     if coord is None:
         st.error("Coordinator not available (ADK error).")
         st.stop()
+
     result = coord.run_once(zip_code)
     st.session_state.last_result = result
     st.session_state.last_zip = zip_code
@@ -134,7 +149,6 @@ if should_run:
         "zip": zip_code,
         "risk": (result.get("analysis") or {}).get("risk", "—"),
         "eta": (result.get("plan") or {}).get("eta_min", "—"),
-        "llm": "AI Studio",
         "adk": "ON" if adk_ok else "ERROR",
     })
     st.session_state["history"] = hist[-12:]
@@ -184,7 +198,6 @@ elif fresh_status == "STALE":
 else:
     chips.append(badge(f"{label}: unknown", "gray"))
 
-chips.append(badge("LLM: Google AI Studio", "green"))
 st.markdown(" ".join(chips), unsafe_allow_html=True)
 
 # ---------- GRID LAYOUT ----------
@@ -200,24 +213,19 @@ with col_left:
         else:
             risk_txt = analysis.get("risk", "—")
             dist_km = analysis.get("distance_km")
-            # Optional: show whether inside the advisory circle if we have radius + dist
             radius_km = (advisory or {}).get("radius_km")
-
             bullets = [
                 f"- **ZIP:** `{zip_code}`",
                 f"- **Risk:** **{risk_txt}**",
             ]
             if isinstance(dist_km, (int, float)):
                 bullets.append(f"- **Distance to storm center:** {dist_km:.1f} km")
-            # Show inside/outside advisory if possible
             if isinstance(dist_km, (int, float)) and isinstance(radius_km, (int, float)):
-                where = "Inside" if dist_km <= float(radius_km) else "Outside"
-                bullets.append(f"- **Advisory area:** {where} (radius ≈ {float(radius_km):.1f} km)")
-
+                where = "Inside" if float(dist_km) <= float(radius_km) else "Outside"
+                bullets.append(f"- **Storm area:** {where} (radius ≈ {float(radius_km):.1f} km)")
             st.markdown("\n".join(bullets))
     else:
         st.info("Risk analysis unavailable.")
-
 
 with col_mid:
     st.subheader("Checklist (Risk-aware)")
@@ -241,6 +249,7 @@ with col_map:
         if analysis.get("risk") == "ERROR":
             st.info("Map is hidden because the ZIP is invalid/unknown.")
         else:
+            # --- Build layers (fast) ---
             layers = []
             # Advisory circle
             if advisory and advisory.get("center") and advisory.get("radius_km"):
@@ -285,12 +294,32 @@ with col_map:
                         pickable=True,
                     )
                 )
+
             view_lat = (zip_point or advisory.get("center") or {"lat": 25.77})["lat"]
             view_lon = (zip_point or advisory.get("center") or {"lon": -80.19})["lon"]
             view_state = pdk.ViewState(latitude=view_lat, longitude=view_lon, zoom=9, pitch=0)
-            st.pydeck_chart(pdk.Deck(map_style=None, initial_view_state=view_state, layers=layers))
 
-# Row 2: Route on left (spans left + mid) | Map continues on right (spacer)
+            # --- Make map cheaper on each loop: cache deck by a signature ---
+            map_sig = (
+                advisory.get("issued_at"),
+                (advisory.get("center") or {}).get("lat") if advisory else None,
+                (advisory.get("center") or {}).get("lon") if advisory else None,
+                advisory.get("radius_km"),
+                (zip_point or {}).get("lat") if zip_point else None,
+                (zip_point or {}).get("lon") if zip_point else None,
+                (plan or {}).get("lat") if plan else None,
+                (plan or {}).get("lon") if plan else None,
+            )
+
+            if st.session_state.get("last_map_sig") != map_sig:
+                deck = pdk.Deck(map_style=None, initial_view_state=view_state, layers=layers)
+                st.session_state["last_map_chart"] = deck
+                st.session_state["last_map_sig"] = map_sig
+
+            if st.session_state.get("last_map_chart"):
+                st.pydeck_chart(st.session_state["last_map_chart"])
+
+# Row 2: Route on left (spans left + mid)
 left_span, _ = st.columns([2.0, 1.6], gap="large")
 with left_span:
     st.subheader("Route")
@@ -305,9 +334,9 @@ with left_span:
         st.info("No open shelters found.")
 
 # ---------- Below the grid ----------
-st.markdown("")  # small spacer
+st.markdown("")
 
-# AI Rumor Check — full width
+# AI Rumor Check — full width (on-demand only; no background LLM)
 if show_verifier:
     st.subheader("AI Rumor Check")
     if analysis.get("risk") == "ERROR":
@@ -319,7 +348,6 @@ if show_verifier:
 
         if LLM_NONCE_KEY not in st.session_state:
             st.session_state[LLM_NONCE_KEY] = 0
-
         if st.session_state.get(LLM_CLEARED_KEY):
             st.session_state.pop(LLM_CLEARED_KEY, None)
 
@@ -398,6 +426,8 @@ if show_verifier:
 
 # Collapsibles
 with st.expander("Advisory (details)", expanded=False):
+    issued_at = (advisory or {}).get("issued_at", "")
+    fresh_status, fresh_detail = compute_freshness(issued_at)
     if advisory:
         st.json(advisory)
         if issued_at:
@@ -422,12 +452,9 @@ with st.expander("Agent Status", expanded=False):
     ]
     st.code("\n".join(status_lines), language="text")
 
-# --- History (collapsible, cleaned columns) ---
-import pandas as pd
-
+# --- History (collapsible) ---
 with st.expander("History", expanded=False):
     raw_hist = st.session_state.get("history", [])
-
     if raw_hist:
         display_rows = []
         for r in raw_hist:
@@ -438,9 +465,8 @@ with st.expander("History", expanded=False):
                 "eta": "—" if r.get("eta") in (None, "—") else str(r.get("eta")),  # left-align as text
                 "adk": r.get("adk", "—"),
             })
-
         df = pd.DataFrame(display_rows, columns=["time", "zip", "risk", "eta", "adk"])
-        st.dataframe(df, hide_index=True, width="stretch")  # <- updated here
+        st.dataframe(df, hide_index=True, use_container_width=True)
 
         c1, c2 = st.columns([1, 6])
         with c1:
@@ -452,4 +478,3 @@ with st.expander("History", expanded=False):
             st.caption(f"{len(raw_hist)} run(s) in this session.")
     else:
         st.caption("No session runs yet.")
-
