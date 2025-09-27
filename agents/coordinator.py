@@ -1,7 +1,7 @@
-# agents/coordinator.py — Option B (no offline arg)
+# agents/coordinator.py
 from __future__ import annotations
 from typing import Dict, Any
-from time import perf_counter  # <-- needed
+from time import perf_counter
 
 from agents.watcher import Watcher
 from agents.analyzer import assess_risk
@@ -10,16 +10,15 @@ from agents.communicator import build_checklist
 from core.parallel_exec import ParallelRunner
 
 class Coordinator:
-    def __init__(self, data_dir: str = "data", use_adk_preferred: bool = True):
+    def __init__(self, data_dir: str = "data", adk_enabled: bool = True):
         self.watcher = Watcher(data_dir=data_dir)
-        self.runner = ParallelRunner(use_adk_preferred=use_adk_preferred)
+        self.runner = ParallelRunner(adk_enabled=adk_enabled)  # <- pass the switch
 
     def run_once(self, zip_code: str) -> Dict[str, Any]:
         timings: Dict[str, int] = {}
         errors: Dict[str, str] = {}
 
-        # 1) Load data (local)
-        t0 = perf_counter()  # <-- define t0 BEFORE using it
+        t0 = perf_counter()
         try:
             advisory = self.watcher.get_advisory()
             zip_centroids = self.watcher.get_zip_centroids()
@@ -29,7 +28,6 @@ class Coordinator:
             errors["watcher"] = str(e)
         timings["watcher_ms"] = round((perf_counter() - t0) * 1000)
 
-        # 2) Run Analyzer + Planner in parallel
         def _analyze():
             return assess_risk(zip_code, advisory, zip_centroids)
 
@@ -43,8 +41,6 @@ class Coordinator:
 
         analysis = results.get("analyzer") or {}
         plan = results.get("planner")
-
-        # 3) Build checklist (fan-in)
         checklist = build_checklist(analysis)
 
         timings.update(par_timings)

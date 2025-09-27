@@ -6,12 +6,19 @@ import importlib, importlib.util
 TaskMap = Dict[str, Callable[[], Any]]
 
 class ParallelRunner:
-    """Run tasks in parallel. Prefer Google ADK ParallelAgent if available & enabled; else fallback."""
-    def __init__(self, use_adk_preferred: bool = True,
-                preferred_modules: Tuple[str, ...] = ("google_adk", "google_adk_parallel", "a2a_sdk", "adk")):
+    """
+    Run tasks in parallel. If `adk_enabled=True` AND an ADK module is importable,
+    use ADK's ParallelAgent; otherwise fall back to local threads.
+    """
+    def __init__(
+        self,
+        adk_enabled: bool = True,
+        preferred_modules: Tuple[str, ...] = ("google_adk", "google_adk_parallel", "a2a_sdk", "adk"),
+    ):
         self._adk_mod: Optional[Any] = None
         self._adk_ok = False
-        if use_adk_preferred:
+
+        if adk_enabled:
             for modname in preferred_modules:
                 try:
                     if importlib.util.find_spec(modname) is not None:
@@ -19,6 +26,7 @@ class ParallelRunner:
                         self._adk_ok = True
                         break
                 except Exception:
+                    # keep probing others
                     pass
 
     def run(self, tasks: TaskMap) -> Tuple[Dict[str, Any], Dict[str, int], Dict[str, str]]:

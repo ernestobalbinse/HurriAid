@@ -28,8 +28,9 @@ if autorefresh_on:
 
 # --- Coordinator bootstrap ---
 if ("coordinator" not in st.session_state) or (st.session_state.get("use_adk_enabled") != use_adk_enabled):
-    st.session_state.coordinator = Coordinator(data_dir="data", use_adk_preferred=use_adk_enabled)
+    st.session_state.coordinator = Coordinator(data_dir="data", adk_enabled=use_adk_enabled)
     st.session_state.use_adk_enabled = use_adk_enabled
+
 coord = st.session_state.coordinator
 
 # Preload persisted history
