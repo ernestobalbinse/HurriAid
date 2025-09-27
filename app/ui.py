@@ -1,21 +1,24 @@
+# app/ui.py — Step 5: ADK on/off toggle + Communicator + History
 import streamlit as st
 from datetime import datetime
 from urllib.parse import urlencode
-from streamlit_autorefresh import st_autorefresh
-
 
 from agents.coordinator import Coordinator
 
 st.set_page_config(page_title="HurriAid", layout="wide")
-
 
 # --- Sidebar ---
 st.sidebar.title("HurriAid")
 zip_code = st.sidebar.text_input("Enter ZIP code", value="33101", key="zip_input")
 offline_mode = st.sidebar.toggle("Offline Mode", value=True, key="offline_toggle")
 update_now = st.sidebar.button("Update Now")
-use_adk = st.sidebar.toggle("Prefer Google ADK ParallelAgent", value=True)
 
+# Explicit enable/disable for ADK (default: enabled)
+use_adk_enabled = st.sidebar.toggle(
+    "Use Google ADK",
+    value=True,
+    help="Enable or Disable use of Google ADK"
+)
 
 # Optional auto‑refresh
 autorefresh_on = st.sidebar.toggle("Auto Refresh", value=False, help="Continuously re‑run to simulate a loop.", key="auto_refresh_toggle")
@@ -28,15 +31,15 @@ if autorefresh_on:
         st.warning("Auto Refresh requires 'streamlit-autorefresh'. Run: pip install streamlit-autorefresh")
 
 # --- Coordinator bootstrap ---
-if ("coordinator" not in st.session_state) or (st.session_state.get("use_adk") != use_adk):
-    st.session_state.coordinator = Coordinator(data_dir="data", use_adk_preferred=use_adk)
-    st.session_state.use_adk = use_adk
+if ("coordinator" not in st.session_state) or (st.session_state.get("use_adk_enabled") != use_adk_enabled):
+    st.session_state.coordinator = Coordinator(data_dir="data", use_adk_preferred=use_adk_enabled)
+    st.session_state.use_adk_enabled = use_adk_enabled
 coord = st.session_state.coordinator
 
 # Change detection
 zip_changed = (st.session_state.get("last_zip") != zip_code)
 
-# --- Header / Status ---
+# --- Header ---
 st.title("HurriAid")
 st.write(f"Last opened: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -55,7 +58,7 @@ if should_run:
         "risk": (result.get("analysis") or {}).get("risk", "—"),
         "eta": (result.get("plan") or {}).get("eta_min", "—"),
     })
-    st.session_state.history = hist[-12:] # keep last 12 runs
+    st.session_state.history = hist[-12:]  # keep last 12 runs
 
 result = st.session_state.get("last_result", {})
 advisory = result.get("advisory", {})
@@ -83,7 +86,6 @@ if advisory:
 else:
     st.info("Advisory data unavailable.")
 
-
 st.subheader("Risk")
 if analysis:
     if "distance_km" in analysis:
@@ -94,7 +96,6 @@ if analysis:
 else:
     st.info("Risk analysis unavailable.")
 
-
 st.subheader("Route")
 if plan:
     st.success(f"Nearest open shelter: {plan['name']} ({plan['distance_km']:.1f} km, {plan['eta_min']} min)")
@@ -104,13 +105,11 @@ if plan:
 else:
     st.info("No open shelters found.")
 
-
 st.subheader("Checklist (Risk‑aware)")
 if checklist:
     st.write("\n".join(f"- {it}" for it in checklist))
 else:
     st.write("- Water (3 days)\n- Non-perishable food\n- Medications\n- Flashlight & batteries\n- First aid kit\n- Important documents in a waterproof bag")
-
 
 st.subheader("Agent Status")
 status_lines = [
@@ -122,16 +121,9 @@ status_lines = [
 ]
 st.code("\n".join(status_lines), language="text")
 
-
 st.subheader("Run History")
 hist = st.session_state.get("history", [])
 if hist:
     st.table(hist)
 else:
     st.caption("No runs yet.")
-
-# Track last inputs to detect changes (so typing a new ZIP triggers a run)
-last_zip = st.session_state.get("last_zip")
-last_offline = st.session_state.get("last_offline")
-zip_changed = (last_zip != zip_code)
-offline_changed = (last_offline != offline_mode)
