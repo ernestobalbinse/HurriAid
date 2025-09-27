@@ -193,8 +193,8 @@ if risk_val == "HIGH":
     chips.append(badge("RISK: HIGH", "red"))
 elif risk_val == "MEDIUM":
     chips.append(badge("RISK: MEDIUM", "amber"))
-elif risk_val == "LOW":
-    chips.append(badge("RISK: LOW", "green"))
+elif risk_val == "SAFE":
+    chips.append(badge("RISK: SAFE", "green"))
 elif risk_val == "ERROR":
     chips.append(badge("RISK: ERROR", "red"))
 else:
