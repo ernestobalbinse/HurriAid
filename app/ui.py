@@ -1,16 +1,10 @@
 # app/ui.py — AI Studio by default (no billing), optional Vertex if explicitly enabled
 import os
 import streamlit as st
-USE_VERTEX = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "FALSE").upper() == "TRUE"
-
-# Hard-stop if we’re in AI Studio mode and missing key
-if not USE_VERTEX and not os.getenv("GOOGLE_API_KEY"):
-    st.error("AI Studio key missing. Set GOOGLE_API_KEY or create a .env with GOOGLE_API_KEY=...")
-    st.stop()
 from datetime import datetime
 from urllib.parse import urlencode
 
-# Optional: load a .env if present (e.g., at repo root or next to your agent)
+# ----- Load .env first (so env vars are available to checks) -----
 try:
     from dotenv import load_dotenv  # pip install python-dotenv
     load_dotenv()
@@ -26,13 +20,12 @@ if not USE_VERTEX:
         st.error("AI Studio key missing. Set environment variable GOOGLE_API_KEY or create a .env with GOOGLE_API_KEY=YOUR_KEY.")
         st.stop()
 else:
-    # Vertex path — only used if you intentionally flip the switch to TRUE
+    # Vertex path — used only if you intentionally flip the switch to TRUE
     PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
     LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-east4")
     if not PROJECT:
         st.error("GOOGLE_CLOUD_PROJECT not set. For Vertex mode, set GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION and GOOGLE_APPLICATION_CREDENTIALS.")
         st.stop()
-    # (Do NOT init aiplatform here for AI Studio mode; only when using Vertex)
     try:
         from google.cloud import aiplatform
         aiplatform.init(project=PROJECT, location=LOCATION)
@@ -48,7 +41,7 @@ from tools.geo import circle_polygon
 from core.utils import load_history
 from core.ui_helpers import badge, compute_freshness
 from agents.coordinator import Coordinator
-from agents.verifier import Verifier
+from agents.verifier_llm import verify_items_with_llm  # <- interactive LLM tab uses this
 
 st.set_page_config(page_title="HurriAid", layout="wide")
 
@@ -80,21 +73,9 @@ interval_sec = st.sidebar.slider(
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Settings")
-show_map = st.sidebar.toggle(
-    "Show Map",
-    value=True,
-    key=f"{APP_NS}_show_map",
-)
-show_verifier = st.sidebar.toggle(
-    "Show Verifier",
-    value=True,
-    key=f"{APP_NS}_show_verifier",
-)
-show_history = st.sidebar.toggle(
-    "Show History",
-    value=True,
-    key=f"{APP_NS}_show_history",
-)
+show_map = st.sidebar.toggle("Show Map", value=True, key=f"{APP_NS}_show_map")
+show_verifier = st.sidebar.toggle("Show Verifier", value=True, key=f"{APP_NS}_show_verifier")
+show_history = st.sidebar.toggle("Show History", value=True, key=f"{APP_NS}_show_history")
 
 # --- Demo Mode (sidebar) ---
 st.sidebar.markdown("---")
@@ -204,14 +185,14 @@ st.write(f"Last opened: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # ---------------- Status chips ----------------
 chips = []
-risk = (analysis or {}).get("risk", "—")
-if risk == "HIGH":
+risk_val = (analysis or {}).get("risk", "—")
+if risk_val == "HIGH":
     chips.append(badge("RISK: HIGH", "red"))
-elif risk == "MEDIUM":
+elif risk_val == "MEDIUM":
     chips.append(badge("RISK: MEDIUM", "amber"))
-elif risk == "LOW":
+elif risk_val == "LOW":
     chips.append(badge("RISK: LOW", "green"))
-elif risk == "ERROR":
+elif risk_val == "ERROR":
     chips.append(badge("RISK: ERROR", "red"))
 else:
     chips.append(badge("RISK: —", "gray"))
@@ -227,7 +208,6 @@ else:
 
 # LLM backend chip
 chips.append(badge("LLM: AI Studio" if not USE_VERTEX else "LLM: Vertex", "green" if not USE_VERTEX else "amber"))
-
 st.markdown(" ".join(chips), unsafe_allow_html=True)
 
 # ---------------- Error banners from agents ----------------
@@ -279,6 +259,7 @@ else:
     st.info("No open shelters found.")
 
 # Map (guarded, self-clearing)
+import pydeck as pdk  # ensure import exists above too
 map_box = st.container()
 if show_map:
     with map_box:
@@ -353,7 +334,7 @@ else:
         "- Important documents in a waterproof bag"
     )
 
-# Verifier (Rumor Check): LLM (ADK) + Manual tabs
+# Verifier (Rumor Check) — LLM (ADK) only
 verifier_box = st.container()
 if show_verifier:
     with verifier_box:
@@ -361,101 +342,89 @@ if show_verifier:
         if analysis.get("risk") == "ERROR":
             st.info("Verifier is disabled because the ZIP is invalid/unknown.")
         else:
-            tab_llm, tab_manual = st.tabs(["LLM (ADK)", "Manual check"])
+            # Interactive LLM text box (same UX as before, but no Manual tab)
+            from agents.verifier_llm import verify_items_with_llm
 
-            # LLM (ADK) tab — output returned from parallel step
-            with tab_llm:
-                overall = (verify.get("overall") or "CLEAR").upper()
-                matches = verify.get("matches", [])
+            LLM_RESULT_KEY  = f"{APP_NS}_llm_result"
+            LLM_NONCE_KEY   = f"{APP_NS}_llm_nonce"
+            LLM_CLEARED_KEY = f"{APP_NS}_llm_cleared"
 
-                if overall == "ERROR":
-                    st.error(verify.get("error", "LLM is not configured."))
-                elif (overall in ("CLEAR", "SAFE")) and not matches:
-                    st.success("No rumor flags detected.")
-                elif overall == "SAFE":
-                    st.success("Verifier result: SAFE")
-                    for m in matches:
-                        st.markdown(f"- **Rumor:** {m['pattern']} → **{m['verdict']}** — {m.get('note','')}")
-                elif overall == "FALSE":
-                    st.error("Verifier result: FALSE")
-                    for m in matches:
-                        st.markdown(f"- **Rumor:** {m['pattern']} → **{m['verdict']}** — {m.get('note','')}")
+            if LLM_NONCE_KEY not in st.session_state:
+                st.session_state[LLM_NONCE_KEY] = 0
+
+            llm_default_value = "Open windows during hurricane"
+            if st.session_state.get(LLM_CLEARED_KEY):
+                llm_default_value = ""
+                st.session_state.pop(LLM_CLEARED_KEY, None)
+
+            llm_text_key = f"{APP_NS}_llm_text_{st.session_state[LLM_NONCE_KEY]}"
+            st.caption("Enter one rumor per line. We'll check each with the LLM.")
+            llm_text = st.text_area(
+                "Rumor(s) to verify",
+                value=llm_default_value,
+                key=llm_text_key,
+                help="Examples: 'drink seawater' (FALSE), 'drink water' (TRUE), 'taping windows' (MISLEADING)."
+            )
+
+            c1, c2, _ = st.columns([1, 1, 6])
+            with c1:
+                run_llm_check = st.button("Check with LLM", key=f"{APP_NS}_llm_run_btn")
+            with c2:
+                clear_llm = st.button("Clear", key=f"{APP_NS}_llm_clear_btn")
+
+            llm_cache = st.session_state.setdefault("llm_rumor_cache", {})
+
+            if clear_llm:
+                st.session_state.pop(LLM_RESULT_KEY, None)
+                st.session_state[LLM_CLEARED_KEY] = True
+                st.session_state[LLM_NONCE_KEY] += 1
+                st.rerun()
+
+            if run_llm_check:
+                items = [line.strip() for line in llm_text.splitlines() if line.strip()]
+                if not items:
+                    st.info("Type at least one rumor to verify.")
                 else:
-                    st.warning(f"Verifier result: {overall}")
-                    for m in matches:
-                        st.markdown(f"- **Rumor:** {m['pattern']} → **{m['verdict']}** — {m.get('note','')}")
-
-            # Manual tab — interactive checker (keeps your clear + nonce trick)
-            with tab_manual:
-                RESULT_KEY  = f"{APP_NS}_rumor_result"
-                NONCE_KEY   = f"{APP_NS}_rumor_nonce"
-                CLEARED_KEY = f"{APP_NS}_rumor_cleared"
-
-                if NONCE_KEY not in st.session_state:
-                    st.session_state[NONCE_KEY] = 0
-
-                default_value = "Open windows during hurricane"
-                if st.session_state.get(CLEARED_KEY):
-                    default_value = ""
-                    st.session_state.pop(CLEARED_KEY, None)
-
-                text_key  = f"{APP_NS}_rumor_text_{st.session_state[NONCE_KEY]}"
-                demo_text = st.text_area(
-                    "Enter rumor to verify",
-                    value=default_value,
-                    key=text_key,
-                    help="Try: 'drink seawater', 'taping windows', 'drink water', etc."
-                )
-
-                c1, c2, _ = st.columns([1, 1, 6])
-                with c1:
-                    run_check = st.button("Check rumor", key=f"{APP_NS}_rumor_btn")
-                with c2:
-                    clear_check = st.button("Clear", key=f"{APP_NS}_rumor_clear")
-
-                if clear_check:
-                    st.session_state.pop(RESULT_KEY, None)
-                    st.session_state[CLEARED_KEY] = True
-                    st.session_state[NONCE_KEY] += 1
-                    st.rerun()
-
-                if run_check:
-                    st.session_state[RESULT_KEY] = Verifier(data_dir="data").check(demo_text)
-
-                verify_live = st.session_state.get(RESULT_KEY)
-                if not verify_live:
-                    st.info("Enter a statement and click **Check rumor**.")
-                else:
-                    overall2 = (verify_live.get("overall") or "CLEAR").upper()
-                    matches2 = verify_live.get("matches", [])
-                    for m in matches2:
-                        m["verdict"] = str(m.get("verdict", "")).upper()
-
-                    if matches2:
-                        if any(m["verdict"] == "FALSE" for m in matches2):
-                            overall2 = "FALSE"
-                        elif all(m["verdict"] == "TRUE" for m in matches2):
-                            overall2 = "SAFE"
-                        else:
-                            overall2 = "CAUTION"
-
-                    if (overall2 in ("CLEAR", "SAFE")) and not matches2:
-                        st.success("No rumor flags detected.")
-                    elif overall2 == "SAFE":
-                        st.success("Verifier result: SAFE")
-                        for m in matches2:
-                            st.markdown(f"- **Rumor:** {m['pattern']} → **{m['verdict']}** — {m.get('note','')}")
-                    elif overall2 == "FALSE":
-                        st.error("Verifier result: FALSE")
-                        for m in matches2:
-                            st.markdown(f"- **Rumor:** {m['pattern']} → **{m['verdict']}** — {m.get('note','')}")
+                    key_joined = "\n".join(items)
+                    if key_joined in llm_cache:
+                        st.session_state[LLM_RESULT_KEY] = llm_cache[key_joined]
                     else:
-                        st.warning(f"Verifier result: {overall2}")
-                        for m in matches2:
-                            st.markdown(f"- **Rumor:** {m['pattern']} → **{m['verdict']}** — {m.get('note','')}")
+                        res = verify_items_with_llm(items)
+                        llm_cache[key_joined] = res
+                        st.session_state[LLM_RESULT_KEY] = res
 
+            # Fall back to coordinator’s batch result if no local run yet
+            llm_live = st.session_state.get(LLM_RESULT_KEY) or verify
+
+            overall = (llm_live.get("overall") or "CLEAR").upper()
+            matches = llm_live.get("matches", [])
+
+            if overall == "ERROR":
+                msg = (llm_live.get("error") or "")
+                umsg = msg.upper()
+                if any(k in umsg for k in ("API KEY NOT VALID", "API_KEY_INVALID")):
+                    st.error("AI Studio API key is invalid or restricted. Set GOOGLE_API_KEY and remove restrictions for local dev.")
+                elif any(k in umsg for k in ("UNAVAILABLE", "OVERLOADED", "503", "TIMEOUT")):
+                    st.warning("The model is busy. We back off automatically; please try again in a few seconds.")
+                else:
+                    st.error(msg or "LLM error.")
+            elif (overall in ("CLEAR", "SAFE")) and not matches:
+                st.success("No rumor flags detected.")
+            elif overall == "SAFE":
+                st.success("Verifier result: SAFE")
+                for m in matches:
+                    st.markdown(f"- **Rumor:** {m['pattern']} → **{str(m['verdict']).upper()}** — {m.get('note','')}")
+            elif overall == "FALSE":
+                st.error("Verifier result: FALSE")
+                for m in matches:
+                    st.markdown(f"- **Rumor:** {m['pattern']} → **{str(m['verdict']).upper()}** — {m.get('note','')}")
+            else:
+                st.warning(f"Verifier result: {overall}")
+                for m in matches:
+                    st.markdown(f"- **Rumor:** {m['pattern']} → **{str(m['verdict']).upper()}** — {m.get('note','')}")
 else:
     verifier_box.empty()
+
 
 # Agent Status
 st.subheader("Agent Status")
