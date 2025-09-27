@@ -229,62 +229,71 @@ elif plan:
 else:
     st.info("No open shelters found.")
 
-# Map
-if show_map:
-    st.subheader("Map")
-if analysis.get("risk") == "ERROR":
-    st.info("Map is hidden because the ZIP is invalid/unknown.")
-else:
-    layers = []
-    # Advisory circle
-    if advisory and advisory.get("center") and advisory.get("radius_km"):
-        center = advisory["center"]
-        poly = circle_polygon(center["lat"], center["lon"], float(advisory["radius_km"]))
-        layers.append(
-            pdk.Layer(
-                "PolygonLayer",
-                data=[{"polygon": poly, "name": "Advisory"}],
-                get_polygon="polygon",
-                get_fill_color=[255, 0, 0, 40],
-                get_line_color=[200, 0, 0],
-                line_width_min_pixels=1,
-                stroked=True,
-                filled=True,
-                pickable=False,
-            )
-        )
-    # ZIP centroid
-    if zip_point:
-        layers.append(
-            pdk.Layer(
-                "ScatterplotLayer",
-                data=[{"position": [zip_point["lon"], zip_point["lat"]], "label": "ZIP"}],
-                get_position="position",
-                get_radius=200,
-                radius_min_pixels=4,
-                get_fill_color=[0, 122, 255, 200],
-                pickable=True,
-            )
-        )
-    # Nearest shelter
-    if plan:
-        layers.append(
-            pdk.Layer(
-                "ScatterplotLayer",
-                data=[{"position": [plan["lon"], plan["lat"]], "label": plan["name"]}],
-                get_position="position",
-                get_radius=200,
-                radius_min_pixels=5,
-                get_fill_color=[0, 180, 0, 220],
-                pickable=True,
-            )
-        )
+# ---- Map (guarded, self-clearing) ----
+map_box = st.container()  # placeholder container for the whole Map panel
 
-    # View: center on ZIP if available, else advisory center
-    view_lat = (zip_point or advisory.get("center") or {"lat": 25.77})["lat"]
-    view_lon = (zip_point or advisory.get("center") or {"lon": -80.19})["lon"]
-    view_state = pdk.ViewState(latitude=view_lat, longitude=view_lon, zoom=9, pitch=0)
-    st.pydeck_chart(pdk.Deck(map_style=None, initial_view_state=view_state, layers=layers))
+if show_map:
+    with map_box:
+        st.subheader("Map")
+        if analysis.get("risk") == "ERROR":
+            st.info("Map is hidden because the ZIP is invalid/unknown.")
+        else:
+            layers = []
+
+            # Advisory circle
+            if advisory and advisory.get("center") and advisory.get("radius_km"):
+                center = advisory["center"]
+                poly = circle_polygon(center["lat"], center["lon"], float(advisory["radius_km"]))
+                layers.append(
+                    pdk.Layer(
+                        "PolygonLayer",
+                        data=[{"polygon": poly, "name": "Advisory"}],
+                        get_polygon="polygon",
+                        get_fill_color=[255, 0, 0, 40],
+                        get_line_color=[200, 0, 0],
+                        line_width_min_pixels=1,
+                        stroked=True,
+                        filled=True,
+                        pickable=False,
+                    )
+                )
+
+            # ZIP centroid
+            if result.get("zip_point"):
+                zp = result["zip_point"]
+                layers.append(
+                    pdk.Layer(
+                        "ScatterplotLayer",
+                        data=[{"position": [zp["lon"], zp["lat"]], "label": "ZIP"}],
+                        get_position="position",
+                        get_radius=200,
+                        radius_min_pixels=4,
+                        get_fill_color=[0, 122, 255, 200],
+                        pickable=True,
+                    )
+                )
+
+            # Nearest shelter
+            if plan:
+                layers.append(
+                    pdk.Layer(
+                        "ScatterplotLayer",
+                        data=[{"position": [plan["lon"], plan["lat"]], "label": plan["name"]}],
+                        get_position="position",
+                        get_radius=200,
+                        radius_min_pixels=5,
+                        get_fill_color=[0, 180, 0, 220],
+                        pickable=True,
+                    )
+                )
+
+            view_lat = (result.get("zip_point") or advisory.get("center") or {"lat": 25.77})["lat"]
+            view_lon = (result.get("zip_point") or advisory.get("center") or {"lon": -80.19})["lon"]
+            view_state = pdk.ViewState(latitude=view_lat, longitude=view_lon, zoom=9, pitch=0)
+            st.pydeck_chart(pdk.Deck(map_style=None, initial_view_state=view_state, layers=layers))
+else:
+    map_box.empty()  # force-clear anything previously rendered
+
 
 # Checklist
 st.subheader("Checklist (Risk-aware)")
