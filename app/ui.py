@@ -259,7 +259,6 @@ else:
     st.info("No open shelters found.")
 
 # Map (guarded, self-clearing)
-import pydeck as pdk  # ensure import exists above too
 map_box = st.container()
 if show_map:
     with map_box:
@@ -334,17 +333,14 @@ else:
         "- Important documents in a waterproof bag"
     )
 
-# Verifier (Rumor Check) — LLM (ADK) only
+# ---- Verifier (Rumor Check) — LLM (ADK) only, no default items until user runs ----
 verifier_box = st.container()
 if show_verifier:
     with verifier_box:
-        st.subheader("Verifier (Rumor Check)")
+        st.subheader("AI Rumor Check")
         if analysis.get("risk") == "ERROR":
             st.info("Verifier is disabled because the ZIP is invalid/unknown.")
         else:
-            # Interactive LLM text box (same UX as before, but no Manual tab)
-            from agents.verifier_llm import verify_items_with_llm
-
             LLM_RESULT_KEY  = f"{APP_NS}_llm_result"
             LLM_NONCE_KEY   = f"{APP_NS}_llm_nonce"
             LLM_CLEARED_KEY = f"{APP_NS}_llm_cleared"
@@ -352,18 +348,18 @@ if show_verifier:
             if LLM_NONCE_KEY not in st.session_state:
                 st.session_state[LLM_NONCE_KEY] = 0
 
-            llm_default_value = "Open windows during hurricane"
+            llm_default_value = ""
             if st.session_state.get(LLM_CLEARED_KEY):
                 llm_default_value = ""
                 st.session_state.pop(LLM_CLEARED_KEY, None)
 
             llm_text_key = f"{APP_NS}_llm_text_{st.session_state[LLM_NONCE_KEY]}"
-            st.caption("Enter one rumor per line. We'll check each with the LLM.")
+            st.caption("Enter statements or rumors to verify with the LLM (one per line).")
             llm_text = st.text_area(
-                "Rumor(s) to verify",
+                "Enter rumor(s) to verify:",
                 value=llm_default_value,
                 key=llm_text_key,
-                help="Examples: 'drink seawater' (FALSE), 'drink water' (TRUE), 'taping windows' (MISLEADING)."
+                help="Examples: 'drink seawater' (False), 'drink water' (True), 'taping windows' (Misleading).",
             )
 
             c1, c2, _ = st.columns([1, 1, 6])
@@ -393,35 +389,60 @@ if show_verifier:
                         llm_cache[key_joined] = res
                         st.session_state[LLM_RESULT_KEY] = res
 
-            # Fall back to coordinator’s batch result if no local run yet
-            llm_live = st.session_state.get(LLM_RESULT_KEY) or verify
+            # Only show results after the user runs a check
+            llm_live = st.session_state.get(LLM_RESULT_KEY)
 
-            overall = (llm_live.get("overall") or "CLEAR").upper()
-            matches = llm_live.get("matches", [])
-
-            if overall == "ERROR":
-                msg = (llm_live.get("error") or "")
-                umsg = msg.upper()
-                if any(k in umsg for k in ("API KEY NOT VALID", "API_KEY_INVALID")):
-                    st.error("AI Studio API key is invalid or restricted. Set GOOGLE_API_KEY and remove restrictions for local dev.")
-                elif any(k in umsg for k in ("UNAVAILABLE", "OVERLOADED", "503", "TIMEOUT")):
-                    st.warning("The model is busy. We back off automatically; please try again in a few seconds.")
-                else:
-                    st.error(msg or "LLM error.")
-            elif (overall in ("CLEAR", "SAFE")) and not matches:
-                st.success("No rumor flags detected.")
-            elif overall == "SAFE":
-                st.success("Verifier result: SAFE")
-                for m in matches:
-                    st.markdown(f"- **Rumor:** {m['pattern']} → **{str(m['verdict']).upper()}** — {m.get('note','')}")
-            elif overall == "FALSE":
-                st.error("Verifier result: FALSE")
-                for m in matches:
-                    st.markdown(f"- **Rumor:** {m['pattern']} → **{str(m['verdict']).upper()}** — {m.get('note','')}")
+            # Guard: nothing checked yet OR bad type
+            if not isinstance(llm_live, dict) or not llm_live:
+                st.info("Enter rumor text above and click **Check with LLM**.")
             else:
-                st.warning(f"Verifier result: {overall}")
-                for m in matches:
-                    st.markdown(f"- **Rumor:** {m['pattern']} → **{str(m['verdict']).upper()}** — {m.get('note','')}")
+                # Friendly display mapping + de-shout helper
+                VERDICT_LABELS = {
+                    "TRUE": "True", "FALSE": "False", "MISLEADING": "Misleading",
+                    "CAUTION": "Caution", "CLEAR": "Clear", "ERROR": "Error", "SAFE": "Safe",
+                }
+                def de_shout(text: str) -> str:
+                    if isinstance(text, str) and text.isupper():
+                        # simple sentence-casing for ALL CAPS responses
+                        return text.capitalize()
+                    return text
+
+                overall_raw = (llm_live.get("overall") or "CLEAR")
+                overall = overall_raw.upper()
+                matches = llm_live.get("matches", [])
+
+                overall_display = VERDICT_LABELS.get(overall, overall_raw.title())
+
+                if overall == "ERROR":
+                    msg = (llm_live.get("error") or "")
+                    umsg = msg.upper()
+                    if any(k in umsg for k in ("API KEY NOT VALID", "API_KEY_INVALID")):
+                        st.error("AI Studio API key is invalid or restricted. Set GOOGLE_API_KEY and remove restrictions for local dev.")
+                    elif any(k in umsg for k in ("UNAVAILABLE", "OVERLOADED", "503", "TIMEOUT")):
+                        st.warning("The model is busy. Please try again shortly.")
+                    else:
+                        st.error(msg or "LLM error.")
+                elif (overall in ("CLEAR", "SAFE")) and not matches:
+                    st.success("No rumor flags detected.")
+                elif overall == "SAFE":
+                    st.success(f"Verifier result: {overall_display}")
+                    for m in matches:
+                        verdict = VERDICT_LABELS.get(str(m.get("verdict","")).upper(), str(m.get("verdict","")).title())
+                        note = de_shout(m.get("note",""))
+                        st.markdown(f"- **Rumor:** {m.get('pattern','')} → **{verdict}** — {note}")
+                elif overall == "FALSE":
+                    st.error(f"Verifier result: {overall_display}")
+                    for m in matches:
+                        verdict = VERDICT_LABELS.get(str(m.get("verdict","")).upper(), str(m.get("verdict","")).title())
+                        note = de_shout(m.get("note",""))
+                        st.markdown(f"- **Rumor:** {m.get('pattern','')} → **{verdict}** — {note}")
+                else:
+                    st.warning(f"Verifier result: {overall_display}")
+                    for m in matches:
+                        verdict = VERDICT_LABELS.get(str(m.get("verdict","")).upper(), str(m.get("verdict","")).title())
+                        note = de_shout(m.get("note",""))
+                        st.markdown(f"- **Rumor:** {m.get('pattern','')} → **{verdict}** — {note}")
+
 else:
     verifier_box.empty()
 
