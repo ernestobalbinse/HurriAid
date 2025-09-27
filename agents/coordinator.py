@@ -1,8 +1,7 @@
+# agents/coordinator.py — Step 5 (matches UI toggle)
 from __future__ import annotations
-from email import errors
 from typing import Dict, Any
 from time import perf_counter
-
 
 from agents.watcher import Watcher
 from agents.analyzer import assess_risk
@@ -34,10 +33,8 @@ class Coordinator:
         def _analyze():
             return assess_risk(zip_code, advisory, zip_centroids)
 
-
         def _plan():
             return nearest_open_shelter(zip_code, zip_centroids, shelters)
-
 
         results, par_timings, par_errors = self.runner.run({
             "analyzer": _analyze,
@@ -48,10 +45,8 @@ class Coordinator:
         plan = results.get("planner")
         checklist = build_checklist(analysis)
 
-
         timings.update(par_timings)
         errors.update(par_errors)
-
 
         return {
             "advisory": advisory,

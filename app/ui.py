@@ -14,63 +14,58 @@ st.sidebar.title("HurriAid")
 zip_code = st.sidebar.text_input("Enter ZIP code", value="33101", key="zip_input")
 offline_mode = st.sidebar.toggle("Offline Mode", value=True, key="offline_toggle")
 update_now = st.sidebar.button("Update Now")
+use_adk = st.sidebar.toggle("Prefer Google ADK ParallelAgent", value=True)
 
 
-st.sidebar.caption(
-"Tip: Offline uses local JSON and parallel agents."
-)
-
-# Auto‑refresh controls
+# Optional auto‑refresh
 autorefresh_on = st.sidebar.toggle("Auto Refresh", value=False, help="Continuously re‑run to simulate a loop.", key="auto_refresh_toggle")
 interval_sec = st.sidebar.slider("Refresh every (seconds)", 5, 60, 15, key="auto_refresh_interval")
-
-
 if autorefresh_on:
     try:
-        from streamlit_autorefresh import st_autorefresh # pip install streamlit-autorefresh
+        from streamlit_autorefresh import st_autorefresh
         st_autorefresh(interval=interval_sec * 1000, key="hurri_loop")
     except Exception:
         st.warning("Auto Refresh requires 'streamlit-autorefresh'. Run: pip install streamlit-autorefresh")
 
 # --- Coordinator bootstrap ---
-if "coordinator" not in st.session_state:
-    st.session_state.coordinator = Coordinator(data_dir="data", max_workers=3)
+if ("coordinator" not in st.session_state) or (st.session_state.get("use_adk") != use_adk):
+    st.session_state.coordinator = Coordinator(data_dir="data", use_adk_preferred=use_adk)
+    st.session_state.use_adk = use_adk
 coord = st.session_state.coordinator
 
-# Track last inputs to detect changes (so typing a new ZIP triggers a run)
-last_zip = st.session_state.get("last_zip")
-last_offline = st.session_state.get("last_offline")
-zip_changed = (last_zip != zip_code)
-offline_changed = (last_offline != offline_mode)
+# Change detection
+zip_changed = (st.session_state.get("last_zip") != zip_code)
 
 # --- Header / Status ---
 st.title("HurriAid")
 st.write(f"Last opened: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# --- Run agents (on load, on Update, on AutoRefresh, or if ZIP/Offline changed) ---
-should_run = (
-("last_result" not in st.session_state)
-or update_now
-or autorefresh_on
-or zip_changed
-or offline_changed
-)
-
+# --- Run ---
+should_run = ("last_result" not in st.session_state) or update_now or autorefresh_on or zip_changed
 if should_run:
-    st.session_state.last_result = coord.run_once(zip_code)
-st.session_state.last_run = datetime.now().strftime('%H:%M:%S')
-st.session_state.last_zip = zip_code
-st.session_state.last_offline = offline_mode
-
+    result = coord.run_once(zip_code)
+    st.session_state.last_result = result
+    st.session_state.last_zip = zip_code
+    st.session_state.last_run = datetime.now().strftime('%H:%M:%S')
+    # Append to history
+    hist = st.session_state.get("history", [])
+    hist.append({
+        "time": st.session_state.last_run,
+        "zip": zip_code,
+        "risk": (result.get("analysis") or {}).get("risk", "—"),
+        "eta": (result.get("plan") or {}).get("eta_min", "—"),
+    })
+    st.session_state.history = hist[-12:] # keep last 12 runs
 
 result = st.session_state.get("last_result", {})
 advisory = result.get("advisory", {})
 analysis = result.get("analysis", {})
 plan = result.get("plan")
+checklist = result.get("checklist", [])
 timings = result.get("timings_ms", {})
 errors = result.get("errors", {})
 
-# --- Status Metrics ---
+# --- Metrics ---
 col1, col2, col3, col4 = st.columns(4)
 with col1:
     st.metric("Advisory", advisory.get("category", "—"))
@@ -88,45 +83,33 @@ if advisory:
 else:
     st.info("Advisory data unavailable.")
 
-st.subheader("Shelters")
-if plan:
-    st.success(f"Nearest open shelter: {plan['name']} ({plan['distance_km']:.1f} km, {plan['eta_min']} min)")
-    # Google Maps driving link
-    params = {
-        "api": 1,
-        "destination": f"{plan['lat']},{plan['lon']}"
-    }
-    maps_url = "https://www.google.com/maps/dir/?" + urlencode(params)
-    st.markdown(f"[Open route in Google Maps]({maps_url})")
-else:
-    st.info("No open shelters found.")
 
 st.subheader("Risk")
 if analysis:
     if "distance_km" in analysis:
         st.write(
-            f"ZIP **{zip_code}** risk: **{analysis['risk']}** — "
-            f"distance to advisory center: {analysis['distance_km']:.1f} km."
+            f"ZIP **{zip_code}** risk: **{analysis['risk']}** — distance to advisory center: {analysis['distance_km']:.1f} km."
         )
     st.caption(analysis.get("reason", ""))
 else:
     st.info("Risk analysis unavailable.")
 
+
 st.subheader("Route")
 if plan:
-    st.write("Planner computed an ETA using a constant driving speed (demo assumption).")
+    st.success(f"Nearest open shelter: {plan['name']} ({plan['distance_km']:.1f} km, {plan['eta_min']} min)")
+    params = {"api": 1, "destination": f"{plan['lat']},{plan['lon']}"}
+    maps_url = "https://www.google.com/maps/dir/?" + urlencode(params)
+    st.markdown(f"[Open route in Google Maps]({maps_url})")
 else:
-    st.info("Planner could not find an open shelter.")
+    st.info("No open shelters found.")
 
-st.subheader("Checklist")
-st.write(
-    "- Water (3 days)"
-    "\n- Non-perishable food (3 days)"
-    "\n- Medications (7 days)"
-    "\n- Flashlight & batteries (1 set)"
-    "\n- First aid kit (1)"
-    "\n- Important documents in a waterproof bag"
-)
+
+st.subheader("Checklist (Risk‑aware)")
+if checklist:
+    st.write("\n".join(f"- {it}" for it in checklist))
+else:
+    st.write("- Water (3 days)\n- Non-perishable food\n- Medications\n- Flashlight & batteries\n- First aid kit\n- Important documents in a waterproof bag")
 
 
 st.subheader("Agent Status")
@@ -134,6 +117,21 @@ status_lines = [
     f"Watcher: {timings.get('watcher_ms', '—')} ms" + (f" | ERROR: {errors['watcher']}" if 'watcher' in errors else ""),
     f"Analyzer: {timings.get('analyzer_ms', '—')} ms" + (f" | ERROR: {errors['analyzer']}" if 'analyzer' in errors else ""),
     f"Planner: {timings.get('planner_ms', '—')} ms" + (f" | ERROR: {errors['planner']}" if 'planner' in errors else ""),
+    f"Parallel: {timings.get('parallel_ms', '—')} ms",
     f"Total: {timings.get('total_ms', '—')} ms (ran at {st.session_state.get('last_run', '—')})"
 ]
 st.code("\n".join(status_lines), language="text")
+
+
+st.subheader("Run History")
+hist = st.session_state.get("history", [])
+if hist:
+    st.table(hist)
+else:
+    st.caption("No runs yet.")
+
+# Track last inputs to detect changes (so typing a new ZIP triggers a run)
+last_zip = st.session_state.get("last_zip")
+last_offline = st.session_state.get("last_offline")
+zip_changed = (last_zip != zip_code)
+offline_changed = (last_offline != offline_mode)
