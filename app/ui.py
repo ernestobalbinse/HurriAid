@@ -398,8 +398,6 @@ if show_verifier:
 else:
     verifier_box.empty()
 
-
-
 # Agent Status
 st.subheader("Agent Status")
 status_lines = [

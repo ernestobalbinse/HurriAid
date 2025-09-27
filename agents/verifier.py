@@ -29,6 +29,16 @@ class Verifier:
         t = (text or "").lower()
         for r in rules:
             if r.get("pattern", "").lower() in t:
-                hits.append({"pattern": r["pattern"], "verdict": r["verdict"], "note": r.get("note", "")})
-        overall = "CLEAR" if not hits else ("CAUTION" if any(h["verdict"] != "FALSE" for h in hits) else "FALSE")
+                verdict = str(r.get("verdict", "CAUTION")).upper()
+                hits.append({"pattern": r["pattern"], "verdict": verdict, "note": r.get("note", "")})
+
+        if not hits:
+            overall = "CLEAR"
+        elif any(h["verdict"] == "FALSE" for h in hits):
+            overall = "FALSE"
+        elif all(h["verdict"] == "TRUE" for h in hits):
+            overall = "SAFE"
+        else:
+            overall = "CAUTION"
+
         return {"overall": overall, "matches": hits}
