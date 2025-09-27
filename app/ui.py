@@ -169,12 +169,13 @@ else:
 
 issued_at = (advisory or {}).get("issued_at", "")
 fresh_status, fresh_detail = compute_freshness(issued_at)
+label = "Last update"
 if fresh_status == "FRESH":
-    chips.append(badge(f"FRESHNESS: {fresh_detail}", "green"))
+    chips.append(badge(f"{label}: {fresh_detail}", "green"))
 elif fresh_status == "STALE":
-    chips.append(badge(f"FRESHNESS: {fresh_detail}", "amber"))
+    chips.append(badge(f"{label}: {fresh_detail}", "amber"))
 else:
-    chips.append(badge("FRESHNESS: unknown", "gray"))
+    chips.append(badge(f"{label}: unknown", "gray"))
 
 chips.append(badge("LLM: Google AI Studio", "green"))
 st.markdown(" ".join(chips), unsafe_allow_html=True)
@@ -380,7 +381,7 @@ with st.expander("Advisory (details)", expanded=False):
     if advisory:
         st.json(advisory)
         if issued_at:
-            st.caption(f"Issued at: {issued_at} ({fresh_detail})")
+            st.caption(f"Issued at: {issued_at} — Last update: {fresh_detail}")
     else:
         st.caption("No advisory data.")
 
