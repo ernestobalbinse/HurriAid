@@ -23,15 +23,18 @@ RISK_EXTRAS = {
 }
 
 def build_checklist(analysis: Dict) -> List[str]:
+    """Return an ordered, de-duplicated preparedness checklist.
+    If risk == ERROR, return empty list (UI will hide checklist).
+    """
     risk = (analysis or {}).get("risk", "LOW").upper()
+    if risk == "ERROR":
+        return []
     items = list(BASE_ITEMS)
     if risk in ("MEDIUM", "HIGH"):
         items.extend(RISK_EXTRAS.get("MEDIUM", []))
     if risk == "HIGH":
         items.extend(RISK_EXTRAS.get("HIGH", []))
-    # De-duplicate while preserving order
-    seen = set()
-    ordered = []
+    seen, ordered = set(), []
     for it in items:
         if it not in seen:
             seen.add(it)
