@@ -26,13 +26,6 @@ update_now = st.sidebar.button(
     key=f"{APP_NS}_update",
 )
 
-use_adk_enabled = st.sidebar.toggle(
-    "Use Google ADK",
-    value=True,
-    help="Turn off to force local thread fallback even if ADK is installed.",
-    key=f"{APP_NS}_adk",
-)
-
 autorefresh_on = st.sidebar.toggle(
     "Auto Refresh",
     value=False,
@@ -105,10 +98,10 @@ if autorefresh_on:
     except Exception:
         st.warning("Auto Refresh requires 'streamlit-autorefresh'. Run: pip install streamlit-autorefresh")
 
-# ---------------- Coordinator bootstrap (recreate when toggle flips) ----------------
-if ("coordinator" not in st.session_state) or (st.session_state.get("use_adk_enabled") != use_adk_enabled):
-    st.session_state.coordinator = Coordinator(data_dir="data", adk_enabled=use_adk_enabled)
-    st.session_state.use_adk_enabled = use_adk_enabled
+# Always make a Coordinator once (ADK is required inside Coordinator/ParallelRunner now)
+if "coordinator" not in st.session_state:
+    st.session_state.coordinator = Coordinator(data_dir="data")
+
 coord = st.session_state.coordinator
 
 # Persisted history (load once)
@@ -149,6 +142,11 @@ verify = result.get("verify", {})
 timings = result.get("timings_ms", {})
 errors = result.get("errors", {})
 zip_point = result.get("zip_point")
+
+# If ADK is missing/broken, show a big error and STOP the page
+if errors.get("adk"):
+    st.error("Google ADK is required: " + errors["adk"])
+    st.stop()  # Do not draw the rest of the page (no Risk/Route/Map/etc.)
 
 # ---------------- Header ----------------
 st.title("HurriAid")
