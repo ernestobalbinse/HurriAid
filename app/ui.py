@@ -189,6 +189,7 @@ with col_left:
     if analysis:
         if analysis.get("risk") == "ERROR":
             st.error(analysis.get("reason", "Unknown ZIP — cannot assess risk."))
+            st.stop()
         else:
             risk_txt = analysis.get("risk", "—")
             dist_km = analysis.get("distance_km")
@@ -416,8 +417,10 @@ with st.expander("Agent Status", expanded=False):
 
 # --- History (collapsible, cleaned columns) ---
 import pandas as pd
+
 with st.expander("History", expanded=False):
     raw_hist = st.session_state.get("history", [])
+
     if raw_hist:
         display_rows = []
         for r in raw_hist:
@@ -425,11 +428,12 @@ with st.expander("History", expanded=False):
                 "time": r.get("time", "—"),
                 "zip": r.get("zip", "—"),
                 "risk": r.get("risk", "—"),
-                "eta": "—" if r.get("eta") in (None, "—") else str(r.get("eta")),  # left-aligned
+                "eta": "—" if r.get("eta") in (None, "—") else str(r.get("eta")),  # left-align as text
                 "adk": r.get("adk", "—"),
             })
+
         df = pd.DataFrame(display_rows, columns=["time", "zip", "risk", "eta", "adk"])
-        st.dataframe(df, hide_index=True, use_container_width=True)
+        st.dataframe(df, hide_index=True, width="stretch")  # <- updated here
 
         c1, c2 = st.columns([1, 6])
         with c1:
@@ -441,3 +445,4 @@ with st.expander("History", expanded=False):
             st.caption(f"{len(raw_hist)} run(s) in this session.")
     else:
         st.caption("No session runs yet.")
+
