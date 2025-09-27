@@ -8,7 +8,6 @@ import streamlit as st
 st.set_page_config(page_title="HurriAid", layout="wide", initial_sidebar_state="expanded")
 import pydeck as pdk
 from streamlit_autorefresh import st_autorefresh
-import pandas as pd
 
 # ---- Project modules ----
 from core.parallel_exec import ADKNotAvailable
@@ -35,7 +34,7 @@ if not os.getenv("GOOGLE_API_KEY"):
     )
     st.stop()
 
-# --- Layout tightening CSS (reduce top padding) ---
+# --- Cosmetic tweaks: tighten top space ---
 st.markdown("""
 <style>
 .block-container { padding-top: 0.6rem; }
@@ -45,25 +44,21 @@ h2, h3 { margin-top: .6rem; margin-bottom: .4rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------- Sidebar ----------------
+# ---------------- Sidebar (single block, unique keys) ----------------
 APP_NS = "v8"  # namespace for widget keys
 
 zip_code = st.sidebar.text_input("Enter ZIP code", value="33101", key=f"{APP_NS}_zip")
+
 update_now = st.sidebar.button("Update Now", key=f"{APP_NS}_update")
 
 # Live Watcher (always on) above Demo Mode
 st.sidebar.markdown("---")
 st.sidebar.subheader("Live Watcher")
 watch_interval = st.sidebar.slider(
-    "Check storm data every (seconds)", 10, 300, 60, key=f"{APP_NS}_watch_interval"
+    "Check storm data every (seconds)", 5, 120, 20, key=f"{APP_NS}_watch_interval"
 )
-# Use counters so we only run when the counter increments (not every render)
-watch_count = st_autorefresh(interval=watch_interval * 1000, key=f"{APP_NS}_watch_loop")
-prev_watch_count = st.session_state.get(f"{APP_NS}_prev_watch_count")
-watch_tick = (watch_count is not None) and (prev_watch_count is not None) and (watch_count != prev_watch_count)
-st.session_state[f"{APP_NS}_prev_watch_count"] = watch_count
+st_autorefresh(interval=watch_interval * 1000, key=f"{APP_NS}_watch_loop")
 
-# Demo Mode
 st.sidebar.markdown("---")
 st.sidebar.subheader("Demo Mode")
 demo_mode = st.sidebar.toggle(
@@ -75,27 +70,21 @@ demo_interval = st.sidebar.slider(
 DEFAULT_DEMO_ZIPS = ["33101", "33012", "33301", "33401"]
 demo_zips = DEFAULT_DEMO_ZIPS
 
-demo_count = None
-demo_tick = False
-if "demo_idx" not in st.session_state:
-    st.session_state.demo_idx = 0
-
-if demo_mode:
-    demo_count = st_autorefresh(interval=demo_interval * 1000, key=f"{APP_NS}_demo_loop")
-    prev_demo_count = st.session_state.get(f"{APP_NS}_prev_demo_count")
-    demo_tick = (demo_count is not None) and (prev_demo_count is not None) and (demo_count != prev_demo_count)
-    st.session_state[f"{APP_NS}_prev_demo_count"] = demo_count
-
-    if demo_tick:
-        st.session_state.demo_idx = (st.session_state.demo_idx + 1) % len(demo_zips)
-        zip_code = demo_zips[st.session_state.demo_idx]
-        st.session_state[f"{APP_NS}_zip"] = zip_code  # keep input in sync
-
-# Settings
 st.sidebar.markdown("---")
 st.sidebar.subheader("Settings")
 show_map = st.sidebar.toggle("Show Map", value=True, key=f"{APP_NS}_show_map")
 show_verifier = st.sidebar.toggle("Show Verifier", value=True, key=f"{APP_NS}_show_verifier")
+
+# --- Demo index & behavior ---
+if "demo_idx" not in st.session_state:
+    st.session_state.demo_idx = 0
+
+if demo_mode:
+    count = st_autorefresh(interval=demo_interval * 1000, key=f"{APP_NS}_demo_loop")
+    if count is not None:
+        st.session_state.demo_idx = (st.session_state.demo_idx + 1) % len(demo_zips)
+        zip_code = demo_zips[st.session_state.demo_idx]
+        st.session_state[f"{APP_NS}_zip"] = zip_code  # keep input in sync
 
 # ---------------- Coordinator (ADK mandatory) ----------------
 if "coordinator" not in st.session_state:
@@ -120,22 +109,14 @@ if "persisted_history" not in st.session_state:
     except Exception:
         st.session_state.persisted_history = []
 
-# ---------------- Run triggers (only when something really changed) ----------------
+# ---------------- Run triggers ----------------
 zip_changed = (st.session_state.get("last_zip") != zip_code)
-first_render = ("last_result" not in st.session_state)
-
-# Avoid double-run on the very first render if autorefresh counters are also initialized
-if first_render:
-    watch_tick = False
-    demo_tick = False
-
-should_run = first_render or update_now or zip_changed or watch_tick or demo_tick
+should_run = ("last_result" not in st.session_state) or update_now or zip_changed or demo_mode
 
 if should_run:
     if coord is None:
         st.error("Coordinator not available (ADK error).")
         st.stop()
-
     result = coord.run_once(zip_code)
     st.session_state.last_result = result
     st.session_state.last_zip = zip_code
@@ -149,6 +130,7 @@ if should_run:
         "zip": zip_code,
         "risk": (result.get("analysis") or {}).get("risk", "—"),
         "eta": (result.get("plan") or {}).get("eta_min", "—"),
+        "llm": "Gemini",
         "adk": "ON" if adk_ok else "ERROR",
     })
     st.session_state["history"] = hist[-12:]
@@ -171,6 +153,23 @@ if errors.get("adk"):
 # ---------------- Header ----------------
 st.markdown("<h1 style='margin:0'>HurriAid</h1>", unsafe_allow_html=True)
 st.caption(f"Last opened: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+# --- LLM label helper (pretty model name) ---
+def _pretty_model(mid: str) -> str:
+    if not mid:
+        return "Gemini"
+    if mid.lower().startswith("gemini-"):
+        mid = "Gemini " + mid[7:]
+    parts = mid.replace("-", " ").split()
+    nice = []
+    for p in parts:
+        if p.replace(".", "").isdigit():
+            nice.append(p)
+        else:
+            nice.append(p.capitalize())
+    return " ".join(nice)
+
+MODEL_ID = os.getenv("HURRIAID_MODEL", "gemini-2.0-flash")
 
 # Chips row
 chips = []
@@ -198,6 +197,7 @@ elif fresh_status == "STALE":
 else:
     chips.append(badge(f"{label}: unknown", "gray"))
 
+chips.append(badge(f"LLM: {_pretty_model(MODEL_ID)}", "green"))
 st.markdown(" ".join(chips), unsafe_allow_html=True)
 
 # ---------- GRID LAYOUT ----------
@@ -214,6 +214,7 @@ with col_left:
             risk_txt = analysis.get("risk", "—")
             dist_km = analysis.get("distance_km")
             radius_km = (advisory or {}).get("radius_km")
+
             bullets = [
                 f"- **ZIP:** `{zip_code}`",
                 f"- **Risk:** **{risk_txt}**",
@@ -221,8 +222,9 @@ with col_left:
             if isinstance(dist_km, (int, float)):
                 bullets.append(f"- **Distance to storm center:** {dist_km:.1f} km")
             if isinstance(dist_km, (int, float)) and isinstance(radius_km, (int, float)):
-                where = "Inside" if float(dist_km) <= float(radius_km) else "Outside"
-                bullets.append(f"- **Storm area:** {where} (radius ≈ {float(radius_km):.1f} km)")
+                where = "Inside" if dist_km <= float(radius_km) else "Outside"
+                bullets.append(f"- **Advisory area:** {where} (radius ≈ {float(radius_km):.1f} km)")
+
             st.markdown("\n".join(bullets))
     else:
         st.info("Risk analysis unavailable.")
@@ -249,7 +251,6 @@ with col_map:
         if analysis.get("risk") == "ERROR":
             st.info("Map is hidden because the ZIP is invalid/unknown.")
         else:
-            # --- Build layers (fast) ---
             layers = []
             # Advisory circle
             if advisory and advisory.get("center") and advisory.get("radius_km"):
@@ -294,30 +295,10 @@ with col_map:
                         pickable=True,
                     )
                 )
-
             view_lat = (zip_point or advisory.get("center") or {"lat": 25.77})["lat"]
             view_lon = (zip_point or advisory.get("center") or {"lon": -80.19})["lon"]
             view_state = pdk.ViewState(latitude=view_lat, longitude=view_lon, zoom=9, pitch=0)
-
-            # --- Make map cheaper on each loop: cache deck by a signature ---
-            map_sig = (
-                advisory.get("issued_at"),
-                (advisory.get("center") or {}).get("lat") if advisory else None,
-                (advisory.get("center") or {}).get("lon") if advisory else None,
-                advisory.get("radius_km"),
-                (zip_point or {}).get("lat") if zip_point else None,
-                (zip_point or {}).get("lon") if zip_point else None,
-                (plan or {}).get("lat") if plan else None,
-                (plan or {}).get("lon") if plan else None,
-            )
-
-            if st.session_state.get("last_map_sig") != map_sig:
-                deck = pdk.Deck(map_style=None, initial_view_state=view_state, layers=layers)
-                st.session_state["last_map_chart"] = deck
-                st.session_state["last_map_sig"] = map_sig
-
-            if st.session_state.get("last_map_chart"):
-                st.pydeck_chart(st.session_state["last_map_chart"])
+            st.pydeck_chart(pdk.Deck(map_style=None, initial_view_state=view_state, layers=layers))
 
 # Row 2: Route on left (spans left + mid)
 left_span, _ = st.columns([2.0, 1.6], gap="large")
@@ -334,62 +315,75 @@ with left_span:
         st.info("No open shelters found.")
 
 # ---------- Below the grid ----------
-st.markdown("")
+st.markdown("")  # small spacer
 
-# AI Rumor Check — full width (on-demand only; no background LLM)
+# ========== AI Rumor Check (FORM-BASED, ATOMIC SUBMIT) ==========
 if show_verifier:
     st.subheader("AI Rumor Check")
     if analysis.get("risk") == "ERROR":
         st.info("Verifier is disabled because the ZIP is invalid/unknown.")
     else:
-        LLM_RESULT_KEY  = f"{APP_NS}_llm_result"
-        LLM_NONCE_KEY   = f"{APP_NS}_llm_nonce"
-        LLM_CLEARED_KEY = f"{APP_NS}_llm_cleared"
+        APP_FORM_KEY     = f"{APP_NS}_llm_form"
+        LLM_TEXT_KEY     = f"{APP_NS}_llm_text"
+        LLM_PENDING_CLR  = f"{APP_NS}_llm_text_pending_clear"
+        LLM_RESULT_KEY   = f"{APP_NS}_llm_result"
+        LLM_LAST_QUERY   = f"{APP_NS}_llm_last_query"
 
-        if LLM_NONCE_KEY not in st.session_state:
-            st.session_state[LLM_NONCE_KEY] = 0
-        if st.session_state.get(LLM_CLEARED_KEY):
-            st.session_state.pop(LLM_CLEARED_KEY, None)
-
-        llm_text_key = f"{APP_NS}_llm_text_{st.session_state[LLM_NONCE_KEY]}"
-        st.caption("Enter statements or rumors to verify with the LLM (one per line).")
-        llm_text = st.text_area(
-            "Rumor(s) to verify",
-            value="",
-            key=llm_text_key,
-            help="Examples: 'drink seawater' (False), 'drink water' (True), 'taping windows' (Misleading).",
-        )
-
-        c1, c2, _ = st.columns([1, 1, 6])
-        with c1:
-            run_llm_check = st.button("Check with LLM", key=f"{APP_NS}_llm_run_btn")
-        with c2:
-            clear_llm = st.button("Clear", key=f"{APP_NS}_llm_clear_btn")
-
+        # Persistent cache across runs
         llm_cache = st.session_state.setdefault("llm_rumor_cache", {})
 
-        if clear_llm:
+        # If a clear was requested in the previous run, clear the widget state BEFORE rendering the widget.
+        if st.session_state.get(LLM_PENDING_CLR):
+            st.session_state[LLM_TEXT_KEY] = ""
+            st.session_state.pop(LLM_PENDING_CLR, None)
+
+        st.caption("Enter statements or rumors to verify with the LLM (one per line).")
+
+        with st.form(APP_FORM_KEY, clear_on_submit=False):
+            llm_text = st.text_area(
+                "Rumor(s) to verify",
+                value=st.session_state.get(LLM_TEXT_KEY, ""),
+                key=LLM_TEXT_KEY,
+                help="Examples: 'drink seawater' (False), 'drink water' (True), 'taping windows' (Misleading).",
+            )
+            colA, colB, _ = st.columns([1, 1, 6])
+            with colA:
+                submit_check = st.form_submit_button("Check with LLM")
+            with colB:
+                submit_clear = st.form_submit_button("Clear")
+
+        # Handle Clear: mark pending clear and rerun so the text_area is rebuilt with an empty value
+        if submit_clear:
             st.session_state.pop(LLM_RESULT_KEY, None)
-            st.session_state[LLM_CLEARED_KEY] = True
-            st.session_state[LLM_NONCE_KEY] += 1
+            st.session_state.pop(LLM_LAST_QUERY, None)
+            st.session_state[LLM_PENDING_CLR] = True
             st.rerun()
 
-        if run_llm_check:
-            items = [line.strip() for line in llm_text.splitlines() if line.strip()]
+        # Normalize current query (lines -> items)
+        items = [line.strip() for line in (llm_text or "").splitlines() if line.strip()]
+        key_joined = "\n".join(items)
+
+        # Handle Check: compute fresh result for the *current* text
+        if submit_check:
             if not items:
-                st.info("Type at least one rumor to verify.")
+                # Empty box: clear any previous result instead of showing stale data
+                st.session_state.pop(LLM_RESULT_KEY, None)
+                st.session_state[LLM_LAST_QUERY] = ""
             else:
-                key_joined = "\n".join(items)
                 if key_joined in llm_cache:
                     st.session_state[LLM_RESULT_KEY] = llm_cache[key_joined]
                 else:
                     res = verify_items_with_llm(items)
                     llm_cache[key_joined] = res
                     st.session_state[LLM_RESULT_KEY] = res
+                st.session_state[LLM_LAST_QUERY] = key_joined
 
+        # Render result
         llm_live = st.session_state.get(LLM_RESULT_KEY)
-        if not isinstance(llm_live, dict) or not llm_live:
-            st.info("Enter rumor text above and click **Check with LLM**.")
+        if not items and not llm_live:
+            st.info("Type something and click **Check with LLM**.")
+        elif not llm_live:
+            st.info("Click **Check with LLM** to verify.")
         else:
             VERDICT_LABELS = {
                 "TRUE": "True", "FALSE": "False", "MISLEADING": "Misleading",
@@ -410,7 +404,7 @@ if show_verifier:
                 msg = (llm_live.get("error") or "")
                 umsg = msg.upper()
                 if any(k in umsg for k in ("API KEY NOT VALID", "API_KEY_INVALID")):
-                    st.error("AI Studio API key is invalid or restricted. Set GOOGLE_API_KEY and remove restrictions for local dev.")
+                    st.error("API key invalid/restricted. Set GOOGLE_API_KEY for local dev.")
                 elif any(k in umsg for k in ("UNAVAILABLE", "OVERLOADED", "503", "TIMEOUT")):
                     st.warning("The model is busy. Please try again shortly.")
                 else:
@@ -423,6 +417,7 @@ if show_verifier:
                 for m in matches:
                     note = de_shout(m.get("note",""))
                     st.markdown(f"- **Rumor:** {m['pattern']} — {note}")
+
 
 # Collapsibles
 with st.expander("Advisory (details)", expanded=False):
@@ -452,7 +447,9 @@ with st.expander("Agent Status", expanded=False):
     ]
     st.code("\n".join(status_lines), language="text")
 
-# --- History (collapsible) ---
+# --- History (collapsible, cleaned columns) ---
+import pandas as pd
+
 with st.expander("History", expanded=False):
     raw_hist = st.session_state.get("history", [])
     if raw_hist:
@@ -462,12 +459,11 @@ with st.expander("History", expanded=False):
                 "time": r.get("time", "—"),
                 "zip": r.get("zip", "—"),
                 "risk": r.get("risk", "—"),
-                "eta": "—" if r.get("eta") in (None, "—") else str(r.get("eta")),  # left-align as text
+                "eta": "—" if r.get("eta") in (None, "—") else str(r.get("eta")),
                 "adk": r.get("adk", "—"),
             })
         df = pd.DataFrame(display_rows, columns=["time", "zip", "risk", "eta", "adk"])
-        st.dataframe(df, hide_index=True, use_container_width=True)
-
+        st.dataframe(df, hide_index=True, width="stretch")
         c1, c2 = st.columns([1, 6])
         with c1:
             if st.button("Clear history", key=f"{APP_NS}_clear_history"):
