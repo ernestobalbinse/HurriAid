@@ -302,20 +302,26 @@ else:
         "- Important documents in a waterproof bag"
     )
 
-# Verifier
+# ---- Verifier (Rumor Check) ----
+verifier_box = st.container()  # placeholder
+
 if show_verifier:
-    st.subheader("Verifier (Rumor Check)")
-if analysis.get("risk") == "ERROR":
-    st.info("Verifier is disabled because the ZIP is invalid/unknown.")
+    with verifier_box:
+        st.subheader("Verifier (Rumor Check)")
+        if analysis.get("risk") == "ERROR":
+            st.info("Verifier is disabled because the ZIP is invalid/unknown.")
+        else:
+            overall = verify.get("overall", "CLEAR")
+            matches = verify.get("matches", [])
+            if overall == "CLEAR" and not matches:
+                st.success("No rumor flags detected in the current checklist.")
+            else:
+                st.warning(f"Verifier result: {overall}")
+                for m in matches:
+                    st.markdown(f"- **Pattern:** {m['pattern']} → {m['verdict']} — {m.get('note', '')}")
 else:
-    overall = verify.get("overall", "CLEAR")
-    matches = verify.get("matches", [])
-    if overall == "CLEAR" and not matches:
-        st.success("No rumor flags detected in the current checklist.")
-    else:
-        st.warning(f"Verifier result: {overall}")
-    for m in matches:
-        st.markdown(f"- **Pattern:** {m['pattern']} → {m['verdict']} — {m.get('note', '')}")
+    verifier_box.empty()  # force-clear any prior content
+
 
 # Agent Status
 st.subheader("Agent Status")
