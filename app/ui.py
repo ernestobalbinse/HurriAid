@@ -44,6 +44,60 @@ interval_sec = st.sidebar.slider(
     5, 60, 15,
     key=f"{APP_NS}_autorefresh_interval",
 )
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Settings")
+show_map = st.sidebar.toggle(
+    "Show Map",
+    value=True,
+    key=f"{APP_NS}_show_map",
+)
+show_verifier = st.sidebar.toggle(
+    "Show Verifier",
+    value=True,
+    key=f"{APP_NS}_show_verifier",
+)
+show_history = st.sidebar.toggle(
+    "Show History",
+    value=True,
+    key=f"{APP_NS}_show_history",
+)
+
+# --- Demo Mode (sidebar) ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("Demo Mode")
+demo_mode = st.sidebar.toggle(
+    "Demo Mode",
+    value=False,
+    help="Cycles ZIPs automatically",
+    key=f"{APP_NS}_demo_mode",
+)
+demo_interval = st.sidebar.slider(
+    "Demo step (seconds)",
+    5, 120, 12,
+    key=f"{APP_NS}_demo_interval",
+)
+# Sequence of ZIPs to cycle through (use ones present in your zip_centroids.json)
+DEFAULT_DEMO_ZIPS = ["33101", "33012", "33301", "33401"]
+demo_zips = DEFAULT_DEMO_ZIPS
+
+# Initialize demo index once
+if "demo_idx" not in st.session_state:
+    st.session_state.demo_idx = 0
+
+# If demo is on, auto‑advance index and overwrite the input value shown in the chips/panels
+if demo_mode:
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        # Tick every demo_interval seconds; the return value increments on each refresh
+        count = st_autorefresh(interval=demo_interval * 1000, key=f"{APP_NS}_demo_loop")
+        # Progress through the list using session state index
+        if count is not None:
+            st.session_state.demo_idx = (st.session_state.demo_idx + 1) % len(demo_zips)
+            zip_code = demo_zips[st.session_state.demo_idx]
+    except Exception:
+        st.warning("Demo Mode needs 'streamlit-autorefresh'. Run: pip install streamlit-autorefresh")
+
 if autorefresh_on:
     try:
         from streamlit_autorefresh import st_autorefresh
@@ -176,7 +230,8 @@ else:
     st.info("No open shelters found.")
 
 # Map
-st.subheader("Map")
+if show_map:
+    st.subheader("Map")
 if analysis.get("risk") == "ERROR":
     st.info("Map is hidden because the ZIP is invalid/unknown.")
 else:
@@ -248,7 +303,8 @@ else:
     )
 
 # Verifier
-st.subheader("Verifier (Rumor Check)")
+if show_verifier:
+    st.subheader("Verifier (Rumor Check)")
 if analysis.get("risk") == "ERROR":
     st.info("Verifier is disabled because the ZIP is invalid/unknown.")
 else:
@@ -258,8 +314,8 @@ else:
         st.success("No rumor flags detected in the current checklist.")
     else:
         st.warning(f"Verifier result: {overall}")
-        for m in matches:
-            st.markdown(f"- **Pattern:** {m['pattern']} → {m['verdict']} — {m.get('note', '')}")
+    for m in matches:
+        st.markdown(f"- **Pattern:** {m['pattern']} → {m['verdict']} — {m.get('note', '')}")
 
 # Agent Status
 st.subheader("Agent Status")
@@ -273,9 +329,10 @@ status_lines = [
 st.code("\n".join(status_lines), language="text")
 
 # History
-st.subheader("History")
-hist = st.session_state.get("history", [])
-if hist:
-    st.table(hist)
-else:
-    st.caption("No session runs yet.")
+if show_history:
+    st.subheader("History")
+    hist = st.session_state.get("history", [])
+    if hist:
+        st.table(hist)
+    else:
+        st.caption("No session runs yet.")
