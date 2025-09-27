@@ -5,6 +5,7 @@ from urllib.parse import urlencode
 
 # ---- Third-party ----
 import streamlit as st
+st.set_page_config(page_title="HurriAid", layout="wide", initial_sidebar_state="expanded")
 import pydeck as pdk
 from streamlit_autorefresh import st_autorefresh
 
@@ -33,10 +34,16 @@ if not os.getenv("GOOGLE_API_KEY"):
     )
     st.stop()
 
-# Tighten top padding & heading spacing
 st.markdown("""
 <style>
+/* reduce the big empty space at the very top */
 .block-container { padding-top: 0.6rem; }
+
+/* (optional) shrink Streamlit's top header bar height */
+header[data-testid="stHeader"] { height: 40px; }
+header[data-testid="stHeader"] > div { height: 40px; }
+
+/* slightly tighter section headings */
 h2, h3 { margin-top: .6rem; margin-bottom: .4rem; }
 </style>
 """, unsafe_allow_html=True)
