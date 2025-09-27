@@ -2,6 +2,8 @@
 import streamlit as st
 from datetime import datetime
 from urllib.parse import urlencode
+from core.parallel_exec import ADKNotAvailable
+
 
 import pydeck as pdk
 from tools.geo import circle_polygon
@@ -11,6 +13,11 @@ from core.ui_helpers import badge, compute_freshness
 from agents.coordinator import Coordinator
 
 st.set_page_config(page_title="HurriAid", layout="wide")
+
+if st.session_state.get("adk_error"):
+    st.error("Google ADK is required: " + st.session_state["adk_error"])
+    st.stop()
+
 
 # ---------------- Sidebar (single block, unique keys) ----------------
 APP_NS = "v8"  # namespace for widget keys
@@ -98,9 +105,14 @@ if autorefresh_on:
     except Exception:
         st.warning("Auto Refresh requires 'streamlit-autorefresh'. Run: pip install streamlit-autorefresh")
 
-# Always make a Coordinator once (ADK is required inside Coordinator/ParallelRunner now)
+# Always create once; ADK is mandatory
 if "coordinator" not in st.session_state:
-    st.session_state.coordinator = Coordinator(data_dir="data")
+    try:
+        st.session_state.coordinator = Coordinator(data_dir="data")
+        st.session_state.adk_error = None
+    except ADKNotAvailable as e:
+        st.session_state.coordinator = None
+        st.session_state.adk_error = str(e)
 
 coord = st.session_state.coordinator
 
@@ -121,16 +133,20 @@ if should_run:
     st.session_state.last_zip = zip_code
     st.session_state.last_run = datetime.now().strftime("%H:%M:%S")
 
-    # Append to session history
+    # ---- after you set result / last_run etc. ----
+    # Initialize, append, and persist history safely
     hist = st.session_state.get("history", [])
+    adk_ok = not st.session_state.get("adk_error")  # if you used the try/except bootstrap
+
     hist.append({
         "time": st.session_state.last_run,
         "zip": zip_code,
         "risk": (result.get("analysis") or {}).get("risk", "—"),
         "eta": (result.get("plan") or {}).get("eta_min", "—"),
-        "adk": "ON" if use_adk_enabled else "OFF",
+        "adk": "ON" if adk_ok else "ERROR",  # or just "ON" if you prefer
     })
-    st.session_state.history = hist[-12:]  # keep last 12
+
+    st.session_state["history"] = hist[-12:]  # keep last 12 rows
 
 # ---------------- Unpack result ----------------
 result = st.session_state.get("last_result", {})
@@ -175,8 +191,6 @@ elif fresh_status == "STALE":
 else:
     chips.append(badge("FRESHNESS: unknown", "gray"))
 
-mode_label = "ADK ON" if st.session_state.get("use_adk_enabled", True) else "ADK OFF"
-chips.append(badge(mode_label, "green" if st.session_state.get("use_adk_enabled", True) else "gray"))
 
 st.markdown(" ".join(chips), unsafe_allow_html=True)
 

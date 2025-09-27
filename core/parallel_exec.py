@@ -1,77 +1,78 @@
-# core/parallel_exec.py — Step 10 (ADK mandatory, no fallback)
+# core/parallel_exec.py — ADK mandatory, but no exceptions in __init__
 from __future__ import annotations
-from typing import Callable, Dict, Any, Tuple
+from typing import Callable, Dict, Any, Tuple, Optional
 from time import perf_counter
 import importlib, importlib.util
 
 TaskMap = Dict[str, Callable[[], Any]]
 
-ADK_MODULES = (
-    "google_adk", # preferred
-    "google_adk_parallel", # alternative name, if any
-    "a2a_sdk", # legacy/internal — keep if needed
-    "adk", # last‑ditch alias
-)
+ADK_MODULES = ("google_adk", "google_adk_parallel", "a2a_sdk", "adk")
 
 class ADKNotAvailable(RuntimeError):
     pass
 
 class ParallelRunner:
-    """Parallel executor that **requires** Google ADK.
-    - Loads the first importable module from ADK_MODULES.
-    - Exposes `run(tasks)` which executes tool fns via ADK's ParallelAgent.
-    - If ADK is missing or its API is incompatible, returns an `adk` error and no task results.
-    """
     def __init__(self):
-        self._adk_mod = self._import_adk()
-        self._validate_api()
+        self._adk_mod: Optional[Any] = None
+        self._adk_error: Optional[str] = None
+        self._agent_cls = None
+        self._probe_adk()
 
-    def _import_adk(self):
+    def _probe_adk(self):
+        # Try import
         for name in ADK_MODULES:
             try:
                 if importlib.util.find_spec(name) is not None:
-                    return importlib.import_module(name)
+                    self._adk_mod = importlib.import_module(name)
+                    break
             except Exception:
-                # try next alias
                 pass
-        raise ADKNotAvailable(
-            "Google ADK not found. Install the ADK package (e.g. 'pip install google-adk')."
-        )
-
-    def _validate_api(self):
-        # Expect a ParallelAgent class with register_tool(name, fn) and run_parallel(task_names)
-        ParallelAgent = getattr(self._adk_mod, "ParallelAgent", None)
-        if ParallelAgent is None:
-            raise ADKNotAvailable("ADK module lacks ParallelAgent class.")
-        # Create one instance up front to fail fast on constructor errors
-        self._agent = ParallelAgent()
-        if not hasattr(self._agent, "register_tool") or not hasattr(self._agent, "run_parallel"):
-            raise ADKNotAvailable("ADK ParallelAgent missing register_tool/run_parallel methods.")
+        if not self._adk_mod:
+            self._adk_error = "Google ADK not found. Install the ADK package (e.g. 'pip install google-adk')."
+            return
+        # Validate API
+        agent_cls = getattr(self._adk_mod, "ParallelAgent", None)
+        if agent_cls is None:
+            self._adk_error = "ADK module lacks ParallelAgent class."
+            return
+        if not hasattr(agent_cls, "__call__"):
+            # defensive; most classes are callable to construct
+            self._adk_error = "ADK ParallelAgent is not constructible."
+            return
+        # Check methods on a temp instance
+        try:
+            agent = agent_cls()
+            if not hasattr(agent, "register_tool") or not hasattr(agent, "run_parallel"):
+                self._adk_error = "ADK ParallelAgent missing register_tool/run_parallel methods."
+                return
+            self._agent_cls = agent_cls
+        except Exception as e:
+            self._adk_error = f"ADK initialization failed: {e}"
 
     def run(self, tasks: TaskMap) -> Tuple[Dict[str, Any], Dict[str, int], Dict[str, str]]:
-        t0 = perf_counter()
         results: Dict[str, Any] = {}
         timings_ms: Dict[str, int] = {}
         errors: Dict[str, str] = {}
 
+        t0 = perf_counter()
         try:
-            # fresh agent per run in case tools keep state
-            agent = self._agent.__class__()
-            # register python callables as tools
+            if self._adk_error:
+                raise ADKNotAvailable(self._adk_error)
+
+            agent = self._agent_cls()  # fresh instance per run
             for name, fn in tasks.items():
                 agent.register_tool(name, fn)
-            # execute in parallel
+
             t_adk = perf_counter()
-            adk_out = agent.run_parallel(list(tasks.keys()))
+            out = agent.run_parallel(list(tasks.keys()))
             timings_ms["parallel_ms"] = round((perf_counter() - t_adk) * 1000)
 
-
-            # Collect results per task name; timing keys are optional depending on ADK impl
             for name in tasks.keys():
-                results[name] = adk_out.get(name)
-                ms_key = f"{name}_ms"
-                if ms_key in adk_out:
-                    timings_ms[ms_key] = adk_out[ms_key]
+                results[name] = out.get(name)
+                k = f"{name}_ms"
+                if k in out:
+                    timings_ms[k] = out[k]
+
         except ADKNotAvailable as e:
             errors["adk"] = str(e)
         except Exception as e:
