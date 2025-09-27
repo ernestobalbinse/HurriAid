@@ -1,23 +1,56 @@
-# app/ui.py — cleaned & unified
+# app/ui.py — AI Studio by default (no billing), optional Vertex if explicitly enabled
+import os
 import streamlit as st
+USE_VERTEX = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "FALSE").upper() == "TRUE"
+
+# Hard-stop if we’re in AI Studio mode and missing key
+if not USE_VERTEX and not os.getenv("GOOGLE_API_KEY"):
+    st.error("AI Studio key missing. Set GOOGLE_API_KEY or create a .env with GOOGLE_API_KEY=...")
+    st.stop()
 from datetime import datetime
 from urllib.parse import urlencode
+
+# Optional: load a .env if present (e.g., at repo root or next to your agent)
+try:
+    from dotenv import load_dotenv  # pip install python-dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# ---------------- Runtime mode & sanity checks ----------------
+USE_VERTEX = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "FALSE").upper() == "TRUE"
+
+if not USE_VERTEX:
+    # AI Studio path — no GCP/billing needed
+    if not os.getenv("GOOGLE_API_KEY"):
+        st.error("AI Studio key missing. Set environment variable GOOGLE_API_KEY or create a .env with GOOGLE_API_KEY=YOUR_KEY.")
+        st.stop()
+else:
+    # Vertex path — only used if you intentionally flip the switch to TRUE
+    PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
+    LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-east4")
+    if not PROJECT:
+        st.error("GOOGLE_CLOUD_PROJECT not set. For Vertex mode, set GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION and GOOGLE_APPLICATION_CREDENTIALS.")
+        st.stop()
+    # (Do NOT init aiplatform here for AI Studio mode; only when using Vertex)
+    try:
+        from google.cloud import aiplatform
+        aiplatform.init(project=PROJECT, location=LOCATION)
+    except Exception as e:
+        st.error(f"Google Cloud init failed: {e}")
+        st.caption("Ensure billing is enabled, Vertex AI API is ON, and credentials/roles are configured.")
+        st.stop()
+
+# ---------------- Imports that rely on your project modules ----------------
 from core.parallel_exec import ADKNotAvailable
-
-
 import pydeck as pdk
 from tools.geo import circle_polygon
-
 from core.utils import load_history
 from core.ui_helpers import badge, compute_freshness
 from agents.coordinator import Coordinator
+from agents.verifier import Verifier
 
 st.set_page_config(page_title="HurriAid", layout="wide")
-
-if st.session_state.get("adk_error"):
-    st.error("Google ADK is required: " + st.session_state["adk_error"])
-    st.stop()
-
 
 # ---------------- Sidebar (single block, unique keys) ----------------
 APP_NS = "v8"  # namespace for widget keys
@@ -77,21 +110,16 @@ demo_interval = st.sidebar.slider(
     5, 120, 12,
     key=f"{APP_NS}_demo_interval",
 )
-# Sequence of ZIPs to cycle through (use ones present in your zip_centroids.json)
 DEFAULT_DEMO_ZIPS = ["33101", "33012", "33301", "33401"]
 demo_zips = DEFAULT_DEMO_ZIPS
 
-# Initialize demo index once
 if "demo_idx" not in st.session_state:
     st.session_state.demo_idx = 0
 
-# If demo is on, auto‑advance index and overwrite the input value shown in the chips/panels
 if demo_mode:
     try:
         from streamlit_autorefresh import st_autorefresh
-        # Tick every demo_interval seconds; the return value increments on each refresh
         count = st_autorefresh(interval=demo_interval * 1000, key=f"{APP_NS}_demo_loop")
-        # Progress through the list using session state index
         if count is not None:
             st.session_state.demo_idx = (st.session_state.demo_idx + 1) % len(demo_zips)
             zip_code = demo_zips[st.session_state.demo_idx]
@@ -105,7 +133,7 @@ if autorefresh_on:
     except Exception:
         st.warning("Auto Refresh requires 'streamlit-autorefresh'. Run: pip install streamlit-autorefresh")
 
-# Always create once; ADK is mandatory
+# ---------------- Coordinator (ADK mandatory) ----------------
 if "coordinator" not in st.session_state:
     try:
         st.session_state.coordinator = Coordinator(data_dir="data")
@@ -116,7 +144,12 @@ if "coordinator" not in st.session_state:
 
 coord = st.session_state.coordinator
 
-# Persisted history (load once)
+# If ADK broke during init, show blocking banner and stop
+if st.session_state.get("adk_error"):
+    st.error("Google ADK is required: " + st.session_state["adk_error"])
+    st.stop()
+
+# ---------------- Persisted history ----------------
 if "persisted_history" not in st.session_state:
     try:
         st.session_state.persisted_history = load_history()
@@ -128,48 +161,48 @@ zip_changed = (st.session_state.get("last_zip") != zip_code)
 should_run = ("last_result" not in st.session_state) or update_now or autorefresh_on or zip_changed
 
 if should_run:
+    if coord is None:
+        st.error("Coordinator not available (ADK error).")
+        st.stop()
     result = coord.run_once(zip_code)
     st.session_state.last_result = result
     st.session_state.last_zip = zip_code
     st.session_state.last_run = datetime.now().strftime("%H:%M:%S")
 
-    # ---- after you set result / last_run etc. ----
-    # Initialize, append, and persist history safely
+    # History row
     hist = st.session_state.get("history", [])
-    adk_ok = not st.session_state.get("adk_error")  # if you used the try/except bootstrap
-
+    adk_ok = not st.session_state.get("adk_error")
     hist.append({
         "time": st.session_state.last_run,
         "zip": zip_code,
         "risk": (result.get("analysis") or {}).get("risk", "—"),
         "eta": (result.get("plan") or {}).get("eta_min", "—"),
-        "adk": "ON" if adk_ok else "ERROR",  # or just "ON" if you prefer
+        "llm": "AI Studio" if not USE_VERTEX else "Vertex",
+        "adk": "ON" if adk_ok else "ERROR",
     })
-
-    st.session_state["history"] = hist[-12:]  # keep last 12 rows
+    st.session_state["history"] = hist[-12:]
 
 # ---------------- Unpack result ----------------
-result = st.session_state.get("last_result", {})
-advisory = result.get("advisory", {})
-analysis = result.get("analysis", {})
+result = st.session_state.get("last_result", {}) or {}
+advisory = result.get("advisory", {}) or {}
+analysis = result.get("analysis", {}) or {}
 plan = result.get("plan")
-checklist = result.get("checklist", [])
-verify = result.get("verify", {})
-llm_ok = (verify.get("overall") not in ("ERROR", None))
-timings = result.get("timings_ms", {})
-errors = result.get("errors", {})
+checklist = result.get("checklist", []) or []
+verify = result.get("verify", {}) or {}
+timings = result.get("timings_ms", {}) or {}
+errors = result.get("errors", {}) or {}
 zip_point = result.get("zip_point")
 
-# If ADK is missing/broken, show a big error and STOP the page
+# If ADK exploded during run, block the page (mandatory ADK policy)
 if errors.get("adk"):
     st.error("Google ADK is required: " + errors["adk"])
-    st.stop()  # Do not draw the rest of the page (no Risk/Route/Map/etc.)
+    st.stop()
 
 # ---------------- Header ----------------
 st.title("HurriAid")
 st.write(f"Last opened: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# ---------------- Status chips (use analysis/advisory safely) ----------------
+# ---------------- Status chips ----------------
 chips = []
 risk = (analysis or {}).get("risk", "—")
 if risk == "HIGH":
@@ -183,7 +216,6 @@ elif risk == "ERROR":
 else:
     chips.append(badge("RISK: —", "gray"))
 
-# FRESHNESS chip
 issued_at = (advisory or {}).get("issued_at", "")
 fresh_status, fresh_detail = compute_freshness(issued_at)
 if fresh_status == "FRESH":
@@ -193,18 +225,12 @@ elif fresh_status == "STALE":
 else:
     chips.append(badge("FRESHNESS: unknown", "gray"))
 
-# NEW: LLM chip (OK/ERROR) based on verify.overall
-llm_ok = (verify.get("overall") not in ("ERROR", None))
-chips.append(
-    badge("LLM: OK" if llm_ok else "LLM: ERROR",
-          "green" if llm_ok else "red")
-)
+# LLM backend chip
+chips.append(badge("LLM: AI Studio" if not USE_VERTEX else "LLM: Vertex", "green" if not USE_VERTEX else "amber"))
 
-# render chips
 st.markdown(" ".join(chips), unsafe_allow_html=True)
 
-
-# ---------------- Agent error banners ----------------
+# ---------------- Error banners from agents ----------------
 if errors:
     if errors.get("watcher"):
         st.error(f"Watcher error: {errors['watcher']}")
@@ -213,9 +239,10 @@ if errors:
     if errors.get("planner"):
         st.error(f"Planner error: {errors['planner']}")
     if errors.get("adk"):
-        st.warning(f"ADK fallback used: {errors['adk']}")
+        st.error(f"ADK error: {errors['adk']}")
 
 # ---------------- Panels ----------------
+# Advisory
 st.subheader("Advisory")
 if advisory:
     st.json(advisory)
@@ -251,9 +278,8 @@ elif plan:
 else:
     st.info("No open shelters found.")
 
-# ---- Map (guarded, self-clearing) ----
-map_box = st.container()  # placeholder container for the whole Map panel
-
+# Map (guarded, self-clearing)
+map_box = st.container()
 if show_map:
     with map_box:
         st.subheader("Map")
@@ -261,7 +287,6 @@ if show_map:
             st.info("Map is hidden because the ZIP is invalid/unknown.")
         else:
             layers = []
-
             # Advisory circle
             if advisory and advisory.get("center") and advisory.get("radius_km"):
                 center = advisory["center"]
@@ -279,14 +304,12 @@ if show_map:
                         pickable=False,
                     )
                 )
-
             # ZIP centroid
-            if result.get("zip_point"):
-                zp = result["zip_point"]
+            if zip_point:
                 layers.append(
                     pdk.Layer(
                         "ScatterplotLayer",
-                        data=[{"position": [zp["lon"], zp["lat"]], "label": "ZIP"}],
+                        data=[{"position": [zip_point["lon"], zip_point["lat"]], "label": "ZIP"}],
                         get_position="position",
                         get_radius=200,
                         radius_min_pixels=4,
@@ -294,7 +317,6 @@ if show_map:
                         pickable=True,
                     )
                 )
-
             # Nearest shelter
             if plan:
                 layers.append(
@@ -308,14 +330,12 @@ if show_map:
                         pickable=True,
                     )
                 )
-
-            view_lat = (result.get("zip_point") or advisory.get("center") or {"lat": 25.77})["lat"]
-            view_lon = (result.get("zip_point") or advisory.get("center") or {"lon": -80.19})["lon"]
+            view_lat = (zip_point or advisory.get("center") or {"lat": 25.77})["lat"]
+            view_lon = (zip_point or advisory.get("center") or {"lon": -80.19})["lon"]
             view_state = pdk.ViewState(latitude=view_lat, longitude=view_lon, zoom=9, pitch=0)
             st.pydeck_chart(pdk.Deck(map_style=None, initial_view_state=view_state, layers=layers))
 else:
-    map_box.empty()  # force-clear anything previously rendered
-
+    map_box.empty()
 
 # Checklist
 st.subheader("Checklist (Risk-aware)")
@@ -333,9 +353,7 @@ else:
         "- Important documents in a waterproof bag"
     )
 
-# ---- Verifier (Rumor Check): LLM (ADK) + Manual tabs ----
-from agents.verifier import Verifier
-
+# Verifier (Rumor Check): LLM (ADK) + Manual tabs
 verifier_box = st.container()
 if show_verifier:
     with verifier_box:
@@ -345,13 +363,13 @@ if show_verifier:
         else:
             tab_llm, tab_manual = st.tabs(["LLM (ADK)", "Manual check"])
 
-            # --- LLM (ADK) tab: uses result['verify'] from Coordinator parallel step ---
+            # LLM (ADK) tab — output returned from parallel step
             with tab_llm:
                 overall = (verify.get("overall") or "CLEAR").upper()
                 matches = verify.get("matches", [])
 
                 if overall == "ERROR":
-                    st.error(verify.get("error", "Gemini is not configured."))
+                    st.error(verify.get("error", "LLM is not configured."))
                 elif (overall in ("CLEAR", "SAFE")) and not matches:
                     st.success("No rumor flags detected.")
                 elif overall == "SAFE":
@@ -367,7 +385,7 @@ if show_verifier:
                     for m in matches:
                         st.markdown(f"- **Rumor:** {m['pattern']} → **{m['verdict']}** — {m.get('note','')}")
 
-            # --- Manual tab: your existing interactive checker (unchanged) ---
+            # Manual tab — interactive checker (keeps your clear + nonce trick)
             with tab_manual:
                 RESULT_KEY  = f"{APP_NS}_rumor_result"
                 NONCE_KEY   = f"{APP_NS}_rumor_nonce"
@@ -405,7 +423,6 @@ if show_verifier:
                     st.session_state[RESULT_KEY] = Verifier(data_dir="data").check(demo_text)
 
                 verify_live = st.session_state.get(RESULT_KEY)
-
                 if not verify_live:
                     st.info("Enter a statement and click **Check rumor**.")
                 else:
@@ -436,9 +453,9 @@ if show_verifier:
                         st.warning(f"Verifier result: {overall2}")
                         for m in matches2:
                             st.markdown(f"- **Rumor:** {m['pattern']} → **{m['verdict']}** — {m.get('note','')}")
+
 else:
     verifier_box.empty()
-
 
 # Agent Status
 st.subheader("Agent Status")
