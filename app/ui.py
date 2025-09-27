@@ -155,6 +155,7 @@ analysis = result.get("analysis", {})
 plan = result.get("plan")
 checklist = result.get("checklist", [])
 verify = result.get("verify", {})
+llm_ok = (verify.get("overall") not in ("ERROR", None))
 timings = result.get("timings_ms", {})
 errors = result.get("errors", {})
 zip_point = result.get("zip_point")
@@ -182,6 +183,7 @@ elif risk == "ERROR":
 else:
     chips.append(badge("RISK: —", "gray"))
 
+# FRESHNESS chip
 issued_at = (advisory or {}).get("issued_at", "")
 fresh_status, fresh_detail = compute_freshness(issued_at)
 if fresh_status == "FRESH":
@@ -191,8 +193,16 @@ elif fresh_status == "STALE":
 else:
     chips.append(badge("FRESHNESS: unknown", "gray"))
 
+# NEW: LLM chip (OK/ERROR) based on verify.overall
+llm_ok = (verify.get("overall") not in ("ERROR", None))
+chips.append(
+    badge("LLM: OK" if llm_ok else "LLM: ERROR",
+          "green" if llm_ok else "red")
+)
 
+# render chips
 st.markdown(" ".join(chips), unsafe_allow_html=True)
+
 
 # ---------------- Agent error banners ----------------
 if errors:
@@ -323,7 +333,7 @@ else:
         "- Important documents in a waterproof bag"
     )
 
-# ---- Verifier (Rumor Check) — text first, then buttons; clear resets text ----
+# ---- Verifier (Rumor Check): LLM (ADK) + Manual tabs ----
 from agents.verifier import Verifier
 
 verifier_box = st.container()
@@ -333,67 +343,16 @@ if show_verifier:
         if analysis.get("risk") == "ERROR":
             st.info("Verifier is disabled because the ZIP is invalid/unknown.")
         else:
-            RESULT_KEY  = f"{APP_NS}_rumor_result"
-            NONCE_KEY   = f"{APP_NS}_rumor_nonce"
-            CLEARED_KEY = f"{APP_NS}_rumor_cleared"
+            tab_llm, tab_manual = st.tabs(["LLM (ADK)", "Manual check"])
 
-            if NONCE_KEY not in st.session_state:
-                st.session_state[NONCE_KEY] = 0
+            # --- LLM (ADK) tab: uses result['verify'] from Coordinator parallel step ---
+            with tab_llm:
+                overall = (verify.get("overall") or "CLEAR").upper()
+                matches = verify.get("matches", [])
 
-            # Default text: use empty right after a Clear, otherwise a helpful example
-            default_value = "Open windows during hurricane"
-            if st.session_state.get(CLEARED_KEY):
-                default_value = ""
-                st.session_state.pop(CLEARED_KEY, None)
-
-            # TEXT AREA FIRST (key includes nonce so Clear creates a fresh widget)
-            text_key  = f"{APP_NS}_rumor_text_{st.session_state[NONCE_KEY]}"
-            demo_text = st.text_area(
-                "Enter rumor to verify",
-                value=default_value,
-                key=text_key,
-                help="Try: 'drink seawater', 'taping windows', 'drink water', etc."
-            )
-
-            # BUTTONS UNDER the text box
-            c1, c2, _ = st.columns([1, 1, 6])
-            with c1:
-                run_check = st.button("Check rumor", key=f"{APP_NS}_rumor_btn")
-            with c2:
-                clear_check = st.button("Clear", key=f"{APP_NS}_rumor_clear")
-
-            # Handle Clear: reset result and force a fresh text widget next run
-            if clear_check:
-                st.session_state.pop(RESULT_KEY, None)
-                st.session_state[CLEARED_KEY] = True
-                st.session_state[NONCE_KEY] += 1
-                st.rerun()
-
-            # Run verification on demand
-            if run_check:
-                st.session_state[RESULT_KEY] = Verifier(data_dir="data").check(demo_text)
-
-            verify_live = st.session_state.get(RESULT_KEY)
-
-            if not verify_live:
-                st.info("Enter a statement and click **Check rumor**.")
-            else:
-                # Normalize & roll up (defensive)
-                overall = (verify_live.get("overall") or "CLEAR").upper()
-                matches = verify_live.get("matches", [])
-                for m in matches:
-                    m["verdict"] = str(m.get("verdict", "")).upper()
-
-                if matches:
-                    if any(m["verdict"] == "FALSE" for m in matches):
-                        overall = "FALSE"
-                    elif all(m["verdict"] == "TRUE" for m in matches):
-                        overall = "SAFE"
-                    else:
-                        overall = "CAUTION"
-
-                # Render status
-                if (overall in ("CLEAR", "SAFE")) and not matches:
+                if overall == "ERROR":
+                    st.error(verify.get("error", "Gemini is not configured."))
+                elif (overall in ("CLEAR", "SAFE")) and not matches:
                     st.success("No rumor flags detected.")
                 elif overall == "SAFE":
                     st.success("Verifier result: SAFE")
@@ -407,8 +366,79 @@ if show_verifier:
                     st.warning(f"Verifier result: {overall}")
                     for m in matches:
                         st.markdown(f"- **Rumor:** {m['pattern']} → **{m['verdict']}** — {m.get('note','')}")
+
+            # --- Manual tab: your existing interactive checker (unchanged) ---
+            with tab_manual:
+                RESULT_KEY  = f"{APP_NS}_rumor_result"
+                NONCE_KEY   = f"{APP_NS}_rumor_nonce"
+                CLEARED_KEY = f"{APP_NS}_rumor_cleared"
+
+                if NONCE_KEY not in st.session_state:
+                    st.session_state[NONCE_KEY] = 0
+
+                default_value = "Open windows during hurricane"
+                if st.session_state.get(CLEARED_KEY):
+                    default_value = ""
+                    st.session_state.pop(CLEARED_KEY, None)
+
+                text_key  = f"{APP_NS}_rumor_text_{st.session_state[NONCE_KEY]}"
+                demo_text = st.text_area(
+                    "Enter rumor to verify",
+                    value=default_value,
+                    key=text_key,
+                    help="Try: 'drink seawater', 'taping windows', 'drink water', etc."
+                )
+
+                c1, c2, _ = st.columns([1, 1, 6])
+                with c1:
+                    run_check = st.button("Check rumor", key=f"{APP_NS}_rumor_btn")
+                with c2:
+                    clear_check = st.button("Clear", key=f"{APP_NS}_rumor_clear")
+
+                if clear_check:
+                    st.session_state.pop(RESULT_KEY, None)
+                    st.session_state[CLEARED_KEY] = True
+                    st.session_state[NONCE_KEY] += 1
+                    st.rerun()
+
+                if run_check:
+                    st.session_state[RESULT_KEY] = Verifier(data_dir="data").check(demo_text)
+
+                verify_live = st.session_state.get(RESULT_KEY)
+
+                if not verify_live:
+                    st.info("Enter a statement and click **Check rumor**.")
+                else:
+                    overall2 = (verify_live.get("overall") or "CLEAR").upper()
+                    matches2 = verify_live.get("matches", [])
+                    for m in matches2:
+                        m["verdict"] = str(m.get("verdict", "")).upper()
+
+                    if matches2:
+                        if any(m["verdict"] == "FALSE" for m in matches2):
+                            overall2 = "FALSE"
+                        elif all(m["verdict"] == "TRUE" for m in matches2):
+                            overall2 = "SAFE"
+                        else:
+                            overall2 = "CAUTION"
+
+                    if (overall2 in ("CLEAR", "SAFE")) and not matches2:
+                        st.success("No rumor flags detected.")
+                    elif overall2 == "SAFE":
+                        st.success("Verifier result: SAFE")
+                        for m in matches2:
+                            st.markdown(f"- **Rumor:** {m['pattern']} → **{m['verdict']}** — {m.get('note','')}")
+                    elif overall2 == "FALSE":
+                        st.error("Verifier result: FALSE")
+                        for m in matches2:
+                            st.markdown(f"- **Rumor:** {m['pattern']} → **{m['verdict']}** — {m.get('note','')}")
+                    else:
+                        st.warning(f"Verifier result: {overall2}")
+                        for m in matches2:
+                            st.markdown(f"- **Rumor:** {m['pattern']} → **{m['verdict']}** — {m.get('note','')}")
 else:
     verifier_box.empty()
+
 
 # Agent Status
 st.subheader("Agent Status")
