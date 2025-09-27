@@ -1,8 +1,7 @@
 # agents/verifier_llm.py
 from __future__ import annotations
 from typing import List, Dict, Any
-import os, time, random, json, concurrent.futures
-import re
+import os, time, random, json, concurrent.futures, re
 
 # Google AI Studio SDK (pip install google-genai)
 from google import genai
@@ -89,26 +88,51 @@ def _should_open_circuit(err_msg: str) -> bool:
     u = (err_msg or "").upper()
     return ("UNAVAILABLE" in u) or ("OVERLOADED" in u) or ("503" in u) or ("TIMEOUT" in u)
 
+# ---- Note cleaning utilities ----
+_VERDICT_WORDS = ("TRUE", "FALSE", "MISLEADING", "CAUTION")
+_LEADING_VERDICT_RE = re.compile(r'^\s*(true|false|misleading|caution)\s*(—|-|:|\.)\s*', re.I)
+
+def _limit_words(s: str, max_words: int = 30) -> str:
+    words = s.split()
+    if len(words) <= max_words:
+        return s
+    return " ".join(words[:max_words]).rstrip(",.;:") + "…"
+
 def _sentence_case(s: str) -> str:
-    s = (s or "").strip()
+    """Convert ALL-CAPS to readable sentence case while preserving common acronyms."""
     if not s:
         return s
-    # Avoid screaming: lower + capitalize first char, keep proper nouns as-is
-    s = s.capitalize()
-    # collapse multiple spaces
-    return " ".join(s.split())
+    s = " ".join(s.split())  # collapse whitespace
+    ACRONYMS = ("FEMA", "NOAA", "NWS", "CDC")
+    placeholders = {}
+    for i, ac in enumerate(ACRONYMS):
+        key = f"__ACR_{i}__"
+        placeholders[key] = ac
+        s = re.sub(rf"\b{ac}\b", key, s, flags=re.IGNORECASE)
 
-_LEADING_VERDICT_RE = re.compile(r'^(true|false|misleading|caution)\s*(—|-|:|\.)\s*', re.I)
+    s = s.lower()
+    if s:
+        s = s[:1].upper() + s[1:]
+    s = re.sub(r'([.!?]\s+)([a-z])', lambda m: m.group(1) + m.group(2).upper(), s)
+
+    for key, ac in placeholders.items():
+        s = s.replace(key, ac)
+    return s
+
+def _strip_verdict_echoes(text: str) -> str:
+    """Remove verdict echoes like 'FALSE —', 'True:', and trailing '— FALSE'."""
+    if not text:
+        return text
+    t = text.strip()
+    t = _LEADING_VERDICT_RE.sub("", t).strip()
+    t = re.sub(rf'\s*(—|-|:|–)\s*(?:{"|".join(_VERDICT_WORDS)})\.?\s*$', "", t, flags=re.IGNORECASE)
+    return t.strip()
 
 def _clean_note(raw: str) -> str:
-    """Remove leading verdict echoes and normalize to sentence case."""
-    s = (raw or "").strip()
-    s = _LEADING_VERDICT_RE.sub("", s).strip()  # <-- also removes "Misleading." etc.
-    # sentence case (avoid ALL CAPS)
-    if s:
-        s = s[0].upper() + s[1:]
-    if len(s) > 240:
-        s = s[:237].rstrip() + "…"
+    """Normalize model note: remove verdict words, sentence-case, ≤30 words."""
+    s = _strip_verdict_echoes(raw or "")
+    s = _sentence_case(s)
+    s = _limit_words(s, 30)
     return s
 
 def _merge_overall(matches: List[Dict[str, Any]]) -> str:
@@ -119,7 +143,6 @@ def _merge_overall(matches: List[Dict[str, Any]]) -> str:
         return "FALSE"
     if verdicts and all(v == "TRUE" for v in verdicts):
         return "SAFE"
-    # Prefer MISLEADING over CAUTION if present
     if any(v == "MISLEADING" for v in verdicts):
         return "MISLEADING"
     return "CAUTION"
@@ -130,7 +153,6 @@ def _format_items_block(items: List[str]) -> str:
 def _call_gen_content(client: genai.Client, model_id: str, text: str) -> str:
     """Single model call with timeout+retry; returns raw text."""
     def _once():
-        # Keep it simple for broad compatibility with google-genai
         resp = client.models.generate_content(model=model_id, contents=text)
         return (resp.text or "").strip()
     def _once_to():
@@ -140,14 +162,11 @@ def _call_gen_content(client: genai.Client, model_id: str, text: str) -> str:
 def _parse_or_fallback(raw_text: str, items: List[str]) -> Dict[str, Any]:
     """
     Try to parse strict JSON per schema. If parsing fails, fall back to a
-    very simple keyword classification and include the raw text as note.
+    conservative keyword classification and include a cleaned note.
     """
-    # Try JSON extraction
-    txt = raw_text.strip()
-    # Heuristic: if the model wrapped JSON in code fences
-    if "```" in txt:
-        start = txt.find("{")
-        end   = txt.rfind("}")
+    txt = (raw_text or "").strip()
+    if "```" in txt:  # strip code fences if present
+        start, end = txt.find("{"), txt.rfind("}")
         if start != -1 and end != -1 and end > start:
             txt = txt[start:end+1]
     try:
@@ -156,32 +175,30 @@ def _parse_or_fallback(raw_text: str, items: List[str]) -> Dict[str, Any]:
         matches = []
         for m in obj.get("matches", []):
             v = str(m.get("verdict", "")).upper()
-            if v not in ("TRUE", "FALSE", "MISLEADING", "CAUTION"):
+            if v not in _VERDICT_WORDS:
                 v = "CAUTION"
             note = _clean_note(m.get("note", ""))
             matches.append({"pattern": m.get("pattern", ""), "verdict": v, "note": note})
-        overall = obj.get("overall", "") or _merge_overall(matches)
-        overall = overall.upper()
+        overall = (obj.get("overall") or "").upper() or _merge_overall(matches)
         if overall not in ("SAFE", "FALSE", "MISLEADING", "CAUTION", "CLEAR"):
             overall = _merge_overall(matches)
         return {"overall": overall, "matches": matches}
     except Exception:
         # Fallback: naive keyword scan (VERY conservative)
         matches = []
-        any_false = False
-        any_true  = False
+        any_false = any_true = False
         for it in items:
             low = it.lower()
             if "open windows" in low or "drink seawater" in low or "drive through flood" in low:
-                verdict, note = "FALSE", "Unsafe guidance; increases risk of injury or damage."
+                verdict, note = "FALSE", "Unsafe guidance that increases risk of injury or damage."
                 any_false = True
             elif "taping windows" in low:
                 verdict, note = "MISLEADING", "Tape does not strengthen glass; use shutters or impact-rated protection."
             elif "drink water" in low or "bottled water" in low or "three days of water" in low:
-                verdict, note = "TRUE", "Staying hydrated and storing clean water is recommended."
+                verdict, note = "TRUE", "Storing and drinking clean water is recommended."
                 any_true = True
             else:
-                verdict, note = "CAUTION", "Depends on context or requires local guidance."
+                verdict, note = "CAUTION", "Outside scope or context dependent; check official local guidance."
             matches.append({"pattern": it, "verdict": verdict, "note": _clean_note(note)})
         overall = "FALSE" if any_false else ("SAFE" if matches and all(m["verdict"]=="TRUE" for m in matches) else ("MISLEADING" if any(m["verdict"]=="MISLEADING" for m in matches) else ("CAUTION" if matches else "CLEAR")))
         return {"overall": overall, "matches": matches}

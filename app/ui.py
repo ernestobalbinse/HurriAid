@@ -207,7 +207,7 @@ else:
     chips.append(badge("FRESHNESS: unknown", "gray"))
 
 # LLM backend chip
-chips.append(badge("LLM: AI Studio" if not USE_VERTEX else "LLM: Vertex", "green" if not USE_VERTEX else "amber"))
+chips.append(badge("LLM: Google AI Studio" if not USE_VERTEX else "LLM: Vertex", "green" if not USE_VERTEX else "amber"))
 st.markdown(" ".join(chips), unsafe_allow_html=True)
 
 # ---------------- Error banners from agents ----------------
@@ -430,14 +430,12 @@ if show_verifier:
                         verdict = VERDICT_LABELS.get(str(m.get("verdict","")).upper(), str(m.get("verdict","")).title())
                         note = de_shout(m.get("note",""))
                         st.markdown(f"- **Rumor:** {m['pattern']} — {m.get('note','')}")
-
                 elif overall == "FALSE":
                     st.error(f"Verifier result: {overall_display}")
                     for m in matches:
                         verdict = VERDICT_LABELS.get(str(m.get("verdict","")).upper(), str(m.get("verdict","")).title())
                         note = de_shout(m.get("note",""))
                         st.markdown(f"- **Rumor:** {m['pattern']} — {m.get('note','')}")
-
                 else:
                     st.warning(f"Verifier result: {overall_display}")
                     for m in matches:
