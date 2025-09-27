@@ -190,14 +190,26 @@ with col_left:
         if analysis.get("risk") == "ERROR":
             st.error(analysis.get("reason", "Unknown ZIP — cannot assess risk."))
         else:
-            if "distance_km" in analysis:
-                st.write(
-                    f"ZIP **{zip_code}** risk: **{analysis['risk']}** — "
-                    f"distance to storm center: {analysis['distance_km']:.1f} km."
-                )
-            st.caption(analysis.get("reason", ""))
+            risk_txt = analysis.get("risk", "—")
+            dist_km = analysis.get("distance_km")
+            # Optional: show whether inside the advisory circle if we have radius + dist
+            radius_km = (advisory or {}).get("radius_km")
+
+            bullets = [
+                f"- **ZIP:** `{zip_code}`",
+                f"- **Risk:** **{risk_txt}**",
+            ]
+            if isinstance(dist_km, (int, float)):
+                bullets.append(f"- **Distance to storm center:** {dist_km:.1f} km")
+            # Show inside/outside advisory if possible
+            if isinstance(dist_km, (int, float)) and isinstance(radius_km, (int, float)):
+                where = "Inside" if dist_km <= float(radius_km) else "Outside"
+                bullets.append(f"- **Advisory area:** {where} (radius ≈ {float(radius_km):.1f} km)")
+
+            st.markdown("\n".join(bullets))
     else:
         st.info("Risk analysis unavailable.")
+
 
 with col_mid:
     st.subheader("Checklist (Risk-aware)")
