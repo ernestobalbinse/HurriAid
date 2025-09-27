@@ -3,11 +3,44 @@ from tools.geo import circle_polygon
 import streamlit as st
 from datetime import datetime
 from urllib.parse import urlencode
+from core.ui_helpers import badge, compute_freshness
 
 from agents.coordinator import Coordinator
 from core.utils import load_history
 
 st.set_page_config(page_title="HurriAid", layout="wide")
+
+# --- Status chips ---
+chips = []
+# Risk chip
+risk = (analysis or {}).get("risk", "—")
+if risk == "HIGH":
+    chips.append(badge("RISK: HIGH", "red"))
+elif risk == "MEDIUM":
+    chips.append(badge("RISK: MEDIUM", "amber"))
+elif risk == "LOW":
+    chips.append(badge("RISK: LOW", "green"))
+elif risk == "ERROR":
+    chips.append(badge("RISK: ERROR", "red"))
+else:
+    chips.append(badge("RISK: —", "gray"))
+
+# Freshness chip from advisory.issued_at
+issued_at = (advisory or {}).get("issued_at", "")
+status, detail = compute_freshness(issued_at)
+if status == "FRESH":
+    chips.append(badge(f"FRESHNESS: {detail}", "green"))
+elif status == "STALE":
+    chips.append(badge(f"FRESHNESS: {detail}", "amber"))
+else:
+    chips.append(badge("FRESHNESS: unknown", "gray"))
+
+# Mode chip (if you have Offline Mode wired)
+mode_label = "ADK ON" if st.session_state.get("use_adk_enabled", True) else "ADK OFF"
+chips.append(badge(mode_label, "green" if st.session_state.get("use_adk_enabled", True) else "gray"))
+
+
+st.markdown(" ".join(chips), unsafe_allow_html=True)
 
 # --- Sidebar ---
 st.sidebar.title("HurriAid")
@@ -87,13 +120,27 @@ with col4:
     st.metric("ETA (min)", plan.get("eta_min") if plan else "—")
 
 # --- Panels ---
+if errors:
+    if errors.get("watcher"):
+        st.error(f"Watcher error: {errors['watcher']}")
+    if errors.get("analyzer"):
+        st.error(f"Analyzer error: {errors['analyzer']}")
+    if errors.get("planner"):
+        st.error(f"Planner error: {errors['planner']}")
+    if errors.get("adk"):
+        st.warning(f"ADK fallback used: {errors['adk']}")
+
 st.subheader("Advisory")
 if advisory:
         st.json(advisory)
+if issued_at:
+    st.caption(f"Issued at: {issued_at} ({detail})")
 else:
     st.info("Advisory data unavailable.")
 
 
+
+# --- Risk ---
 st.subheader("Risk")
 if analysis:
     if analysis.get("risk") == "ERROR":
