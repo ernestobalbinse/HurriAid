@@ -34,6 +34,20 @@ class Coordinator:
         # Validate ZIP
         is_valid_zip, msg = validate_zip(zip_code, zip_centroids)
 
+        if not is_valid_zip:
+            # do not run analyzer/planner; do not assume any route/checklist
+            return {
+                "advisory": advisory,
+                "analysis": {"risk": "ERROR", "reason": msg},
+                "plan": None,
+                "checklist": [],          # avoid assumptions
+                "verify": {"overall": "CLEAR", "matches": []},
+                "zip_valid": False,
+                "zip_message": msg,
+                "timings_ms": timings,    # watcher_ms already set
+                "errors": errors,
+            }
+
         # Prepare tasks (Analyzer/Planner only run meaningfully if ZIP exists)
         def _analyze():
             return assess_risk(zip_code, advisory, zip_centroids)

@@ -93,20 +93,25 @@ else:
 
 
 st.subheader("Risk")
-if not zip_valid and zip_message:
-    st.warning(zip_message)
 if analysis:
-    if "distance_km" in analysis:
-        st.write(
-            f"ZIP **{zip_code}** risk: **{analysis['risk']}** — distance to advisory center: {analysis['distance_km']:.1f} km."
-        )
-    st.caption(analysis.get("reason", ""))
+    if analysis.get("risk") == "ERROR":
+        # Show the validation message prominently
+        st.error(analysis.get("reason", "Unknown ZIP — cannot assess risk."))
+    else:
+        if "distance_km" in analysis:
+            st.write(
+                f"ZIP **{zip_code}** risk: **{analysis['risk']}** — "
+                f"distance to advisory center: {analysis['distance_km']:.1f} km."
+            )
+        st.caption(analysis.get("reason", ""))
 else:
     st.info("Risk analysis unavailable.")
 
 
 st.subheader("Route")
-if plan:
+if analysis.get("risk") == "ERROR":
+    st.info("Route is not available because the ZIP is invalid/unknown.")
+elif plan:
     st.success(f"Nearest open shelter: {plan['name']} ({plan['distance_km']:.1f} km, {plan['eta_min']} min)")
     params = {"api": 1, "destination": f"{plan['lat']},{plan['lon']}"}
     maps_url = "https://www.google.com/maps/dir/?" + urlencode(params)
@@ -116,22 +121,32 @@ else:
 
 
 st.subheader("Checklist (Risk‑aware)")
-if checklist:
+if analysis.get("risk") == "ERROR":
+    st.info("Route is not available because the ZIP is invalid/unknown.")
+elif checklist:
     st.write("\n".join(f"- {it}" for it in checklist))
 else:
-    st.write("- Water (3 days)\n- Non-perishable food\n- Medications\n- Flashlight & batteries\n- First aid kit\n- Important documents in a waterproof bag")
-
+    st.markdown(
+        "- Water (3 days)\n"
+        "- Non-perishable food\n"
+        "- Medications\n"
+        "- Flashlight & batteries\n"
+        "- First aid kit\n"
+        "- Important documents in a waterproof bag"
+    )
 
 st.subheader("Verifier (Rumor Check)")
-overall = verify.get("overall", "CLEAR")
-matches = verify.get("matches", [])
-if overall == "CLEAR" and not matches:
-    st.success("No rumor flags detected in the current checklist.")
+if analysis.get("risk") == "ERROR":
+    st.info("Verifier is disabled because the ZIP is invalid/unknown.")
 else:
-    st.warning(f"Verifier result: {overall}")
-    for m in matches:
-        st.write(f"- Pattern: **{m['pattern']}** → {m['verdict']} — {m.get('note', '')}")
-
+    overall = verify.get("overall", "CLEAR")
+    matches = verify.get("matches", [])
+    if overall == "CLEAR" and not matches:
+        st.success("No rumor flags detected in the current checklist.")
+    else:
+        st.warning(f"Verifier result: {overall}")
+        for m in matches:
+            st.markdown(f"- **Pattern:** {m['pattern']} → {m['verdict']} — {m.get('note', '')}")
 
 st.subheader("Agent Status")
 status_lines = [
