@@ -47,7 +47,7 @@ st.write(f"Last opened: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 # --- Run ---
 should_run = ("last_result" not in st.session_state) or update_now or autorefresh_on or zip_changed or mode_changed
 if should_run:
-    result = coord.run_once(zip_code, offline=offline_mode)
+    result = coord.run_once(zip_code)
     st.session_state.last_result = result
     st.session_state.last_zip = zip_code
     st.session_state.last_offline = offline_mode
