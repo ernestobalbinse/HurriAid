@@ -1,19 +1,65 @@
 # agents/verifier_llm.py
-from typing import List, Dict
-import os, time, random, concurrent.futures
+from __future__ import annotations
+from typing import List, Dict, Any
+import os, time, random, json, concurrent.futures
+import re
+
+# Google AI Studio SDK (pip install google-genai)
 from google import genai
 
+# ---------------- Config ----------------
 PRIMARY_MODEL  = os.getenv("HURRIAID_MODEL", "gemini-2.0-flash")
-# Optional hint; will be used only if present. Otherwise we auto-pick.
 FALLBACK_MODEL = os.getenv("HURRIAID_MODEL_FALLBACK", "")
 
-# Circuit breaker (shared process memory). You can reset via env or on app restart.
+PER_CALL_TIMEOUT_SEC = float(os.getenv("HURRIAID_LLM_TIMEOUT", "30"))
+MAX_TRIES            = int(os.getenv("HURRIAID_LLM_RETRIES", "4"))
+
+# Simple circuit breaker (process-scope)
 _CB_FAILS = 0
 _CB_OPEN_UNTIL = 0.0
 
-PER_CALL_TIMEOUT_SEC = float(os.getenv("HURRIAID_LLM_TIMEOUT", "30"))
-MAX_TRIES = int(os.getenv("HURRIAID_LLM_RETRIES", "4"))
+# ---------------- System Prompt ----------------
+SYSTEM_PROMPT = """You are “HurriAid Verifier,” a careful fact checker for hurricane preparedness and response claims.
+Classify each statement as TRUE, FALSE, MISLEADING, or CAUTION, and provide a short, human explanation (“note”).
+Return ONLY the JSON object in the schema below.
 
+Scope:
+- Hurricane safety, preparation, shelters, supplies, evacuation, power, water/food, medical basics, communications, generators, windows/doors, flooding, driving, immediate aftermath.
+- If outside this scope, use CAUTION with a brief reason.
+
+Ground rules:
+- Be conservative with certainty. If guidance is mixed or context-dependent: MISLEADING (say what’s missing) or CAUTION (what’s unknown).
+- Keep explanations factual, neutral, actionable. No fear-mongering or medical advice beyond widely accepted public guidance.
+- Do NOT restate the verdict in `note` (avoid “False — …” / “True: …”).
+- Style: English, sentence case, no ALL CAPS, ≤ 30 words per note.
+- Never invent laws, exact locations, or live advisories. If conditions vary locally, say it may vary and advise checking official local sources.
+
+Verdicts:
+- TRUE — broadly correct and safe per standard guidance.
+- FALSE — incorrect, unsafe, or contradicted by standard guidance.
+- MISLEADING — has a grain of truth but missing critical context.
+- CAUTION — unclear, unverifiable, or outside scope; needs official confirmation.
+
+Output schema (return ONLY this JSON):
+{
+  "overall": "SAFE | FALSE | MISLEADING | CAUTION | CLEAR",
+  "matches": [
+    { "pattern": "<original statement>", "verdict": "TRUE|FALSE|MISLEADING|CAUTION", "note": "<≤30 words, no verdict words>" }
+  ]
+}
+
+How to set overall:
+- If there are no items or no safety concerns found, use "CLEAR" and matches: [].
+- If ANY verdict is FALSE → overall = "FALSE".
+- Else if ALL verdicts are TRUE → overall = "SAFE".
+- Else overall = the most severe among {MISLEADING, CAUTION} present (prefer MISLEADING over CAUTION if both).
+
+Task:
+Classify each of these items and produce the JSON exactly as specified.
+Items (one per line):
+"""
+
+# ---------------- Helpers ----------------
 def _retry_call(fn, max_tries=MAX_TRIES, base=0.8, cap=6.0):
     last = None
     for i in range(max_tries):
@@ -30,29 +76,128 @@ def _call_with_timeout(fn, timeout_sec: float):
         fut = ex.submit(fn)
         return fut.result(timeout=timeout_sec)
 
-def _classify_text(client: genai.Client, model_id: str, text: str) -> str:
-    def _once():
-        resp = client.models.generate_content(model=model_id, contents=text)
-        return (resp.text or "").strip()
-    def _once_to():
-        return _call_with_timeout(_once, PER_CALL_TIMEOUT_SEC)
-    return _retry_call(_once_to)
-
-def _list_flash_like_models(client: genai.Client) -> list[str]:
+def _list_preferred_models(client: genai.Client) -> list[str]:
     try:
         names = [m.name for m in client.models.list()]
-        # Prefer light/cheap-ish flash variants, then anything else as last resort
+        # Prefer flash variants for speed/cost; otherwise anything available
         prefs = [n for n in names if "flash" in n.lower()]
         return prefs or names
     except Exception:
         return []
 
 def _should_open_circuit(err_msg: str) -> bool:
-    u = err_msg.upper()
+    u = (err_msg or "").upper()
     return ("UNAVAILABLE" in u) or ("OVERLOADED" in u) or ("503" in u) or ("TIMEOUT" in u)
 
-def verify_items_with_llm(items: List[str]) -> Dict:
+def _sentence_case(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return s
+    # Avoid screaming: lower + capitalize first char, keep proper nouns as-is
+    s = s.capitalize()
+    # collapse multiple spaces
+    return " ".join(s.split())
+
+_LEADING_VERDICT_RE = re.compile(r'^(true|false|misleading|caution)\s*(—|-|:|\.)\s*', re.I)
+
+def _clean_note(raw: str) -> str:
+    """Remove leading verdict echoes and normalize to sentence case."""
+    s = (raw or "").strip()
+    s = _LEADING_VERDICT_RE.sub("", s).strip()  # <-- also removes "Misleading." etc.
+    # sentence case (avoid ALL CAPS)
+    if s:
+        s = s[0].upper() + s[1:]
+    if len(s) > 240:
+        s = s[:237].rstrip() + "…"
+    return s
+
+def _merge_overall(matches: List[Dict[str, Any]]) -> str:
+    if not matches:
+        return "CLEAR"
+    verdicts = [str(m.get("verdict", "")).upper() for m in matches]
+    if any(v == "FALSE" for v in verdicts):
+        return "FALSE"
+    if verdicts and all(v == "TRUE" for v in verdicts):
+        return "SAFE"
+    # Prefer MISLEADING over CAUTION if present
+    if any(v == "MISLEADING" for v in verdicts):
+        return "MISLEADING"
+    return "CAUTION"
+
+def _format_items_block(items: List[str]) -> str:
+    return "\n".join(it.strip() for it in items if it.strip())
+
+def _call_gen_content(client: genai.Client, model_id: str, text: str) -> str:
+    """Single model call with timeout+retry; returns raw text."""
+    def _once():
+        # Keep it simple for broad compatibility with google-genai
+        resp = client.models.generate_content(model=model_id, contents=text)
+        return (resp.text or "").strip()
+    def _once_to():
+        return _call_with_timeout(_once, PER_CALL_TIMEOUT_SEC)
+    return _retry_call(_once_to)
+
+def _parse_or_fallback(raw_text: str, items: List[str]) -> Dict[str, Any]:
+    """
+    Try to parse strict JSON per schema. If parsing fails, fall back to a
+    very simple keyword classification and include the raw text as note.
+    """
+    # Try JSON extraction
+    txt = raw_text.strip()
+    # Heuristic: if the model wrapped JSON in code fences
+    if "```" in txt:
+        start = txt.find("{")
+        end   = txt.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            txt = txt[start:end+1]
+    try:
+        obj = json.loads(txt)
+        # Normalize verdicts + notes
+        matches = []
+        for m in obj.get("matches", []):
+            v = str(m.get("verdict", "")).upper()
+            if v not in ("TRUE", "FALSE", "MISLEADING", "CAUTION"):
+                v = "CAUTION"
+            note = _clean_note(m.get("note", ""))
+            matches.append({"pattern": m.get("pattern", ""), "verdict": v, "note": note})
+        overall = obj.get("overall", "") or _merge_overall(matches)
+        overall = overall.upper()
+        if overall not in ("SAFE", "FALSE", "MISLEADING", "CAUTION", "CLEAR"):
+            overall = _merge_overall(matches)
+        return {"overall": overall, "matches": matches}
+    except Exception:
+        # Fallback: naive keyword scan (VERY conservative)
+        matches = []
+        any_false = False
+        any_true  = False
+        for it in items:
+            low = it.lower()
+            if "open windows" in low or "drink seawater" in low or "drive through flood" in low:
+                verdict, note = "FALSE", "Unsafe guidance; increases risk of injury or damage."
+                any_false = True
+            elif "taping windows" in low:
+                verdict, note = "MISLEADING", "Tape does not strengthen glass; use shutters or impact-rated protection."
+            elif "drink water" in low or "bottled water" in low or "three days of water" in low:
+                verdict, note = "TRUE", "Staying hydrated and storing clean water is recommended."
+                any_true = True
+            else:
+                verdict, note = "CAUTION", "Depends on context or requires local guidance."
+            matches.append({"pattern": it, "verdict": verdict, "note": _clean_note(note)})
+        overall = "FALSE" if any_false else ("SAFE" if matches and all(m["verdict"]=="TRUE" for m in matches) else ("MISLEADING" if any(m["verdict"]=="MISLEADING" for m in matches) else ("CAUTION" if matches else "CLEAR")))
+        return {"overall": overall, "matches": matches}
+
+# ---------------- Public API ----------------
+def verify_items_with_llm(items: List[str]) -> Dict[str, Any]:
+    """
+    Classify user-provided rumor lines with Gemini (AI Studio).
+    Returns: {"overall": "...", "matches": [...]} or {"overall":"ERROR", "matches":[], "error":"..."}
+    """
     global _CB_FAILS, _CB_OPEN_UNTIL
+
+    # Guard: empty input
+    items = [it.strip() for it in (items or []) if it and it.strip()]
+    if not items:
+        return {"overall": "CLEAR", "matches": []}
 
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
@@ -60,72 +205,42 @@ def verify_items_with_llm(items: List[str]) -> Dict:
 
     now = time.time()
     if now < _CB_OPEN_UNTIL:
-        # Fast-fail while the circuit is open
         return {"overall": "ERROR", "matches": [], "error": "LLM temporarily unavailable (cooling down); please retry."}
 
-    client = genai.Client(api_key=api_key)
+    try:
+        client = genai.Client(api_key=api_key)
+    except Exception as e:
+        return {"overall": "ERROR", "matches": [], "error": f"Failed to init AI client: {e}"}
 
-    # Build candidate model list: primary → explicit fallback → auto-picked flash models
+    # Candidate models: primary → explicit fallback → discovered list
     candidates: list[str] = [PRIMARY_MODEL]
     if FALLBACK_MODEL:
         candidates.append(FALLBACK_MODEL)
-    for n in _list_flash_like_models(client):
+    for n in _list_preferred_models(client):
         if n not in candidates:
             candidates.append(n)
 
+    # Compose one-shot prompt (system + user)
+    user_block = _format_items_block(items)
+    full_prompt = f"{SYSTEM_PROMPT}\n```\n{user_block}\n```"
+
     last_error = None
     for model_id in candidates:
-        out = _run_for_model(client, model_id, items)
-        if out.get("overall") == "ERROR":
-            last_error = out.get("error") or "Unknown LLM error"
-            if _should_open_circuit(last_error):
-                _CB_FAILS += 1
-                # Open circuit for a short cool-off after repeated overloads
-                _CB_OPEN_UNTIL = time.time() + min(30, 5 * _CB_FAILS)  # 5s,10s,15s… capped at 30s
-                continue  # try next candidate
-            else:
-                # Non-transient error (e.g., bad key) — stop trying others
-                return out
-        else:
-            # Success: reset breaker
+        try:
+            raw = _call_gen_content(client, model_id, full_prompt)
+            parsed = _parse_or_fallback(raw, items)
+            # Success -> reset breaker and return
             _CB_FAILS = 0
             _CB_OPEN_UNTIL = 0.0
-            return out
-
-    # If all candidates failed, return last error
-    return {"overall": "ERROR", "matches": [], "error": last_error or "All models failed."}
-
-def _run_for_model(client: genai.Client, model_id: str, items: List[str]) -> Dict:
-    matches = []
-    any_false = False
-    any_true  = False
-
-    for it in items:
-        prompt = (
-            "Classify the following hurricane preparation statement as TRUE, FALSE, or MISLEADING. "
-            "Return the verdict word first, then a brief 1-sentence note.\n"
-            f"Statement: {it}"
-        )
-        try:
-            text = _classify_text(client, model_id, prompt).upper()
+            return parsed
         except concurrent.futures.TimeoutError:
-            return {"overall": "ERROR", "matches": [], "error": f"LLM call failed on {model_id}: TIMEOUT"}
+            last_error = f"LLM call failed on {model_id}: TIMEOUT"
         except Exception as e:
-            return {"overall": "ERROR", "matches": [], "error": f"LLM call failed on {model_id}: {e}"}
+            last_error = f"LLM call failed on {model_id}: {e}"
 
-        verdict = "MISLEADING"
-        if "FALSE" in text:
-            verdict = "FALSE"; any_false = True
-        elif "TRUE" in text:
-            verdict = "TRUE";  any_true  = True
+        # Decide whether to open the circuit for transient overloads
+        if _should_open_circuit(str(last_error)):
+            _CB_FAILS += 1
+            _CB_OPEN_UNTIL = time.time() + min(30, 5 * _CB_FAILS)  # 5s,10s,15s… capped at 30s
 
-        matches.append({"pattern": it, "verdict": verdict, "note": text})
-
-    if any_false:
-        overall = "FALSE"
-    elif matches and all(m["verdict"] == "TRUE" for m in matches):
-        overall = "SAFE"
-    else:
-        overall = "CAUTION" if matches else "CLEAR"
-
-    return {"overall": overall, "matches": matches}
+    return {"overall": "ERROR", "matches": [], "error": last_error or "All models failed."}

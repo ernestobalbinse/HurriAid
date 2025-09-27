@@ -429,19 +429,22 @@ if show_verifier:
                     for m in matches:
                         verdict = VERDICT_LABELS.get(str(m.get("verdict","")).upper(), str(m.get("verdict","")).title())
                         note = de_shout(m.get("note",""))
-                        st.markdown(f"- **Rumor:** {m.get('pattern','')} → **{verdict}** — {note}")
+                        st.markdown(f"- **Rumor:** {m['pattern']} — {m.get('note','')}")
+
                 elif overall == "FALSE":
                     st.error(f"Verifier result: {overall_display}")
                     for m in matches:
                         verdict = VERDICT_LABELS.get(str(m.get("verdict","")).upper(), str(m.get("verdict","")).title())
                         note = de_shout(m.get("note",""))
-                        st.markdown(f"- **Rumor:** {m.get('pattern','')} → **{verdict}** — {note}")
+                        st.markdown(f"- **Rumor:** {m['pattern']} — {m.get('note','')}")
+
                 else:
                     st.warning(f"Verifier result: {overall_display}")
                     for m in matches:
                         verdict = VERDICT_LABELS.get(str(m.get("verdict","")).upper(), str(m.get("verdict","")).title())
                         note = de_shout(m.get("note",""))
-                        st.markdown(f"- **Rumor:** {m.get('pattern','')} → **{verdict}** — {note}")
+                        st.markdown(f"- **Rumor:** {m['pattern']} — {m.get('note','')}")
+
 
 else:
     verifier_box.empty()
