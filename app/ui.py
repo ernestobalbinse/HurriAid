@@ -311,25 +311,93 @@ else:
         "- Important documents in a waterproof bag"
     )
 
-# ---- Verifier (Rumor Check) ----
-verifier_box = st.container()  # placeholder
+# ---- Verifier (Rumor Check) — text first, then buttons; clear resets text ----
+from agents.verifier import Verifier
 
+verifier_box = st.container()
 if show_verifier:
     with verifier_box:
         st.subheader("Verifier (Rumor Check)")
         if analysis.get("risk") == "ERROR":
             st.info("Verifier is disabled because the ZIP is invalid/unknown.")
         else:
-            overall = verify.get("overall", "CLEAR")
-            matches = verify.get("matches", [])
-            if overall == "CLEAR" and not matches:
-                st.success("No rumor flags detected in the current checklist.")
+            RESULT_KEY  = f"{APP_NS}_rumor_result"
+            NONCE_KEY   = f"{APP_NS}_rumor_nonce"
+            CLEARED_KEY = f"{APP_NS}_rumor_cleared"
+
+            if NONCE_KEY not in st.session_state:
+                st.session_state[NONCE_KEY] = 0
+
+            # Default text: use empty right after a Clear, otherwise a helpful example
+            default_value = "Open windows during hurricane"
+            if st.session_state.get(CLEARED_KEY):
+                default_value = ""
+                st.session_state.pop(CLEARED_KEY, None)
+
+            # TEXT AREA FIRST (key includes nonce so Clear creates a fresh widget)
+            text_key  = f"{APP_NS}_rumor_text_{st.session_state[NONCE_KEY]}"
+            demo_text = st.text_area(
+                "Enter rumor to verify",
+                value=default_value,
+                key=text_key,
+                help="Try: 'drink seawater', 'taping windows', 'drink water', etc."
+            )
+
+            # BUTTONS UNDER the text box
+            c1, c2, _ = st.columns([1, 1, 6])
+            with c1:
+                run_check = st.button("Check rumor", key=f"{APP_NS}_rumor_btn")
+            with c2:
+                clear_check = st.button("Clear", key=f"{APP_NS}_rumor_clear")
+
+            # Handle Clear: reset result and force a fresh text widget next run
+            if clear_check:
+                st.session_state.pop(RESULT_KEY, None)
+                st.session_state[CLEARED_KEY] = True
+                st.session_state[NONCE_KEY] += 1
+                st.rerun()
+
+            # Run verification on demand
+            if run_check:
+                st.session_state[RESULT_KEY] = Verifier(data_dir="data").check(demo_text)
+
+            verify_live = st.session_state.get(RESULT_KEY)
+
+            if not verify_live:
+                st.info("Enter a statement and click **Check rumor**.")
             else:
-                st.warning(f"Verifier result: {overall}")
+                # Normalize & roll up (defensive)
+                overall = (verify_live.get("overall") or "CLEAR").upper()
+                matches = verify_live.get("matches", [])
                 for m in matches:
-                    st.markdown(f"- **Pattern:** {m['pattern']} → {m['verdict']} — {m.get('note', '')}")
+                    m["verdict"] = str(m.get("verdict", "")).upper()
+
+                if matches:
+                    if any(m["verdict"] == "FALSE" for m in matches):
+                        overall = "FALSE"
+                    elif all(m["verdict"] == "TRUE" for m in matches):
+                        overall = "SAFE"
+                    else:
+                        overall = "CAUTION"
+
+                # Render status
+                if (overall in ("CLEAR", "SAFE")) and not matches:
+                    st.success("No rumor flags detected.")
+                elif overall == "SAFE":
+                    st.success("Verifier result: SAFE")
+                    for m in matches:
+                        st.markdown(f"- **Rumor:** {m['pattern']} → **{m['verdict']}** — {m.get('note','')}")
+                elif overall == "FALSE":
+                    st.error("Verifier result: FALSE")
+                    for m in matches:
+                        st.markdown(f"- **Rumor:** {m['pattern']} → **{m['verdict']}** — {m.get('note','')}")
+                else:
+                    st.warning(f"Verifier result: {overall}")
+                    for m in matches:
+                        st.markdown(f"- **Rumor:** {m['pattern']} → **{m['verdict']}** — {m.get('note','')}")
 else:
-    verifier_box.empty()  # force-clear any prior content
+    verifier_box.empty()
+
 
 
 # Agent Status

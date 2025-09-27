@@ -2,6 +2,7 @@
     "rules": [
         {"pattern": "drink seawater", "verdict": "FALSE", "note": "Seawater dehydrates you."},
         {"pattern": "open windows during hurricane", "verdict": "FALSE", "note": "Keep windows closed; board if advised."},
-        {"pattern": "taping windows", "verdict": "MISLEADING", "note": "Tape is not a substitute for proper shutters."}
+        {"pattern": "taping windows", "verdict": "MISLEADING", "note": "Tape is not a substitute for proper shutters."},
+        {"pattern": "drink water", "verdict": "TRUE", "note": "Stay hydrated."}
     ]
 }
