@@ -1,5 +1,6 @@
 # agents/watcher.py
 from __future__ import annotations
+from core.units import km_to_mi
 
 import json
 import os
@@ -132,12 +133,15 @@ def _sha256_file(path: str) -> Optional[str]:
 
 def _fmt_watch_text(zip_code: str, risk: str, dist_km: float, inside: bool, radius_km: float) -> str:
     where = "Inside" if inside else "Outside"
+    dist_mi = km_to_mi(dist_km)
+    radius_mi = km_to_mi(radius_km)
     return (
         f"Risk ZIP: {zip_code}\n"
         f"Risk: {risk}\n"
-        f"Distance to storm center: {dist_km:.1f} km\n"
-        f"Advisory area: {where} (radius ≈ {float(radius_km):.1f} km)"
+        f"Distance to storm center: {dist_mi:.1f} mi\n"
+        f"Advisory area: {where} (radius ≈ {radius_mi:.1f} mi)"
     )
+
 
 def _json_from_text(t: Optional[str]) -> Optional[Dict[str, Any]]:
     if not t or not isinstance(t, str):
@@ -246,7 +250,11 @@ def run_watcher_once(data_dir: str, zip_code: str) -> Tuple[Dict[str, Any], Dict
         if sha:
             state["debug"]["advisory_sha256"] = sha
     except Exception as e:
-        state["analysis"] = {"risk": "ERROR", "reason": f"Advisory invalid: {e}"}
+        state["analysis"] = {
+            "risk": risk,
+            "distance_km": round(dist_km, 1),
+            "distance_mi": round(km_to_mi(dist_km) or dist_km * 0.621371, 1),
+        }
         timings["watcher_ms_total"] = (time.perf_counter() - t0_total) * 1000.0
         state["advisory"] = {}
         return state, timings

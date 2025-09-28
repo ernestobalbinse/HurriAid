@@ -3,6 +3,8 @@
 import sys, os, hashlib
 from datetime import datetime
 from urllib.parse import urlencode
+from core.units import km_to_mi
+
 
 # ---- Third-party ----
 import streamlit as st
@@ -273,11 +275,22 @@ with col_left:
                 f"- **ZIP:** `{zip_code}`",
                 f"- **Risk:** **{risk_txt}**",
             ]
-            if isinstance(dist_km, (int, float)):
-                bullets.append(f"- **Distance to storm center:** {dist_km:.1f} km")
+            
+            dist_km = analysis.get("distance_km")
+            dist_mi = analysis.get("distance_mi") or (km_to_mi(dist_km) if isinstance(dist_km, (int, float)) else None)
+            radius_km = (advisory or {}).get("radius_km")
+            radius_mi = (advisory or {}).get("radius_mi") or (km_to_mi(radius_km) if isinstance(radius_km, (int, float)) else None)
+
+            if isinstance(dist_mi, (int, float,)) or isinstance(dist_mi, float):
+                bullets.append(f"- **Distance to storm center:** {float(dist_mi):.1f} mi")
+
             if isinstance(dist_km, (int, float)) and isinstance(radius_km, (int, float)):
                 where = "Inside" if dist_km <= float(radius_km) else "Outside"
-                bullets.append(f"- **Advisory area:** {where} (radius ≈ {float(radius_km):.1f} km)")
+                if isinstance(radius_mi, (int, float)):
+                    bullets.append(f"- **Advisory area:** {where} (radius ≈ {float(radius_mi):.1f} mi)")
+                else:
+                    # fallback if radius_mi not present
+                    bullets.append(f"- **Advisory area:** {where}")
             st.markdown("\n".join(bullets))
 
             # AI explainer
@@ -366,7 +379,12 @@ with left_span:
     if analysis.get("risk") == "ERROR":
         st.info("Route is not available because the ZIP is invalid/unknown.")
     elif plan:
-        st.success(f"Nearest open shelter: {plan['name']} ({plan['distance_km']:.1f} km, {plan['eta_min']} ETA)")
+        plan_dist_km = plan.get("distance_km")
+        plan_dist_mi = plan.get("distance_mi") or (km_to_mi(plan_dist_km) if isinstance(plan_dist_km, (int, float)) else None)
+        if isinstance(plan_dist_mi, (int, float)):
+            st.success(f"Nearest open shelter: {plan['name']} ({plan_dist_mi:.1f} mi, ETA {plan['eta_min']})")
+        else:
+            st.success(f"Nearest open shelter: {plan['name']} ({plan_dist_km:.1f} km, ETA {plan['eta_min']})")
         params = {"api": 1, "destination": f"{plan['lat']},{plan['lon']}"}
         maps_url = "https://www.google.com/maps/dir/?" + urlencode(params)
         st.markdown(f"[Open route in Google Maps]({maps_url})")
@@ -437,9 +455,9 @@ if show_verifier:
         # Render result
         llm_live = st.session_state.get(LLM_RESULT_KEY)
         if not items and not llm_live:
-            st.info("Type something and click **Check with LLM**.")
+            st.info("Type something and click **Check with Google Gemini**.")
         elif not llm_live:
-            st.info("Click **Check with LLM** to verify.")
+            st.info("Click **Check with Google Gemini** to verify.")
         else:
             VERDICT_LABELS = {
                 "TRUE": "True", "FALSE": "False", "MISLEADING": "Misleading",
@@ -478,6 +496,9 @@ if show_verifier:
 with st.expander("Storm Details (.json)", expanded=False):
     if advisory:
         st.json(advisory)
+        rad_mi = advisory.get("radius_mi") or (km_to_mi(advisory.get("radius_km")) if advisory.get("radius_km") is not None else None)
+        if isinstance(rad_mi, (int, float)):
+            st.caption(f"radius_km: {advisory.get('radius_km')}  |  radius_mi: {rad_mi:.1f}")
     else:
         st.caption("No advisory data.")
 
