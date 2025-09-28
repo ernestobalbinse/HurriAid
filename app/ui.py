@@ -1,6 +1,10 @@
 # app/ui.py
 # --- Standard library ---
-import sys, os, hashlib
+import os, sys
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))  # repo root
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+import hashlib
 from datetime import datetime
 from urllib.parse import urlencode
 from core.units import km_to_mi
