@@ -1,65 +1,35 @@
 # agents/watcher.py
 from __future__ import annotations
+from core.advisory import read_advisory, AdvisoryError
 
-import json
+
 import os
+import json
 import math
 import time
+import hashlib
 from typing import Dict, Any, Tuple, Optional
-import secrets, re  # add to your imports at the top
 
+# --- AI explainer (your existing modules) ---
+from agents.ai_explainer import build_risk_explainer_agent
+from core.adk_helpers import run_llm_agent_text_debug
 
-# ---- pgeocode for ZIP -> lat/lon ----
+# --- ZIP -> lat/lon using pgeocode ---
 try:
     import pgeocode  # pip install pgeocode
-    _PGEOCODE_AVAILABLE = True
+    _PGEOCODE_OK = True
 except Exception:
-    _PGEOCODE_AVAILABLE = False
+    _PGEOCODE_OK = False
 
-# ---------- Helpers ----------
-
-def _load_json(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-    
-# Helper: extract first JSON object from a model response
-def _json_from_text(s: str):
-    if not isinstance(s, str):
-        return None
-    m = re.search(r"\{.*\}", s.strip(), re.DOTALL)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except Exception:
-        return None
-
-
-def _resolve_zip_from_helper(zip_code: str) -> Optional[Tuple[float, float]]:
-    """Use project helper if present."""
-    try:
-        from tools.zip_resolver import resolve_zip_latlon  # optional helper
-        lat, lon = resolve_zip_latlon(zip_code)
-        if lat is None or lon is None:
-            return None
-        return float(lat), float(lon)
-    except Exception:
-        return None
-
-_geocoder = None
+_GEOCODER = None
 def _get_geocoder():
-    global _geocoder
-    if _geocoder is None and _PGEOCODE_AVAILABLE:
-        _geocoder = pgeocode.Nominatim("us")
-    return _geocoder
+    global _GEOCODER
+    if _GEOCODER is None and _PGEOCODE_OK:
+        _GEOCODER = pgeocode.Nominatim("us")
+    return _GEOCODER
 
 def _resolve_zip_latlon(zip_code: str) -> Optional[Tuple[float, float]]:
-    # 1) project helper
-    coords = _resolve_zip_from_helper(zip_code)
-    if coords is not None:
-        return coords
-    # 2) pgeocode
-    if not _PGEOCODE_AVAILABLE:
+    if not _PGEOCODE_OK:
         return None
     try:
         nomi = _get_geocoder()
@@ -71,12 +41,13 @@ def _resolve_zip_latlon(zip_code: str) -> Optional[Tuple[float, float]]:
     except Exception:
         return None
 
+# ---------- math & risk ----------
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlmb = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb / 2) ** 2
+    a = math.sin(dphi/2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb/2) ** 2
     return 2 * R * math.asin(math.sqrt(a))
 
 def _cat_rank(cat: str) -> int:
@@ -95,9 +66,11 @@ def _cat_rank(cat: str) -> int:
     return 0
 
 def _risk_heuristic(dist_km: float, radius_km: float, category: str) -> str:
-    # HIGH if inside radius OR (within 50 km at CAT2+)
-    # MEDIUM if within (radius + 120 km) OR inside at TS/CAT1
-    # LOW otherwise
+    """
+    HIGH if inside radius OR (<= 50 km at CAT2+)
+    MEDIUM if <= (radius+120 km) OR inside at TS/CAT1
+    LOW otherwise
+    """
     cat = _cat_rank(category)
     inside = dist_km <= float(radius_km)
     if inside or (dist_km <= 50.0 and cat >= 2):
@@ -115,211 +88,168 @@ def _fmt_watch_text(zip_code: str, risk: str, dist_km: float, inside: bool, radi
         f"Advisory area: {where} (radius ≈ {float(radius_km):.1f} km)"
     )
 
-# --- extract text helper for different Google clients ---
-def _extract_text_from_genai_response(resp):
+# ---------- safe coercions ----------
+def _to_float(x, default: float) -> float:
     try:
-        if getattr(resp, "text", None):
-            return resp.text
+        return float(x)
     except Exception:
-        pass
-    try:
-        return resp.candidates[0].content.parts[0].text
-    except Exception:
-        return None
+        return default
 
-# --- AI explainer backend: ADK -> google-genai (new) -> google-generativeai (old) ---
-def _call_risk_explainer_ai(prompt: str):
-    """
-    Returns: (text, events, err, backend)
-    backend ∈ {'ADK','GENAI:new','GENAI:old','NONE'}
-    """
-    # 1) ADK
-    try:
-        from agents.ai_explainer import build_risk_explainer_agent
-        from core.adk_helpers import run_llm_agent_text_debug
-        agent = build_risk_explainer_agent()
-        text, events, err = run_llm_agent_text_debug(
-            agent, prompt, app_name="hurri_aid", user_id="ui_user", session_id="sess_explainer"
-        )
-        if isinstance(text, str) and text.strip():
-            return text.strip(), events, err, "ADK"
-        if err is None and not events:
-            err = "NO_EVENTS"
-    except Exception as e:
-        text, events, err = None, [], f"ADK_ERROR {type(e).__name__}: {e}"
+def _to_bool(x, default: bool = True) -> bool:
+    if isinstance(x, bool):
+        return x
+    if x is None:
+        return default
+    if isinstance(x, (int, float)):
+        return bool(x)
+    if isinstance(x, str):
+        s = x.strip().lower()
+        if s in {"true", "1", "yes", "y", "on"}:
+            return True
+        if s in {"false", "0", "no", "n", "off"}:
+            return False
+    return default
 
-    # 2) google-genai (new client)
-    genai_new_err = None
-    try:
-        from google import genai as genai_new  # pip install google-genai
-        client = genai_new.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
-        model = os.environ.get("HURRIAID_EXPLAINER_MODEL", "gemini-2.0-flash")
-        # param name is 'contents'
-        resp = client.models.generate_content(model=model, contents=prompt)
-        raw = _extract_text_from_genai_response(resp)
-        if isinstance(raw, str) and raw.strip():
-            return raw.strip(), [], None, "GENAI:new"
-        return None, [], "GENAI_EMPTY", "GENAI:new"
-    except Exception as e:
-        genai_new_err = f"{type(e).__name__}: {e}"
-
-    # 3) google-generativeai (classic)
-    try:
-        import google.generativeai as genai_old  # pip install google-generativeai
-        genai_old.configure(api_key=os.environ.get("GOOGLE_API_KEY"))
-        model = os.environ.get("HURRIAID_EXPLAINER_MODEL", "gemini-2.0-flash")
-        m = genai_old.GenerativeModel(model)
-        resp = m.generate_content(prompt)
-        raw = _extract_text_from_genai_response(resp)
-        if isinstance(raw, str) and raw.strip():
-            return raw.strip(), [], None, "GENAI:old"
-        return None, [], "GENAI_OLD_EMPTY", "GENAI:old"
-    except Exception as e2:
-        return None, [], f"GENAI_BOTH_FAILED (new={genai_new_err}) (old={type(e2).__name__}: {e2})", "NONE"
-
-# ---------- Functional "steps" (Streamlit-safe, no InvocationContext) ----------
-
+# ---------- Step 1: read advisory from file (store RAW + normalized) ----------
 def _step_read_advisory(state: Dict[str, Any], data_dir: str, timings: Dict[str, float]) -> None:
     t0 = time.perf_counter()
-    path = os.path.join(data_dir, "sample_advisory.json")
     try:
-        adv = _load_json(path)
-    except Exception:
-        adv = {}
+        raw, adv_norm, dbg = read_advisory(data_dir)
+    except AdvisoryError as e:
+        # hard fail: surface clear error and stop downstream steps
+        state["errors"] = {**state.get("errors", {}), "advisory": str(e)}
+        state["analysis"] = {"risk": "ERROR", "reason": f"Advisory invalid: {e}"}
+        timings["watcher_ms_read"] = (time.perf_counter() - t0) * 1000.0
+        return
 
-    center = (adv.get("center") or {})
-    adv_norm = {
-        "center": {
-            "lat": float(center.get("lat", 25.77)),
-            "lon": float(center.get("lon", -80.19)),
-        },
-        "radius_km": float(adv.get("radius_km", 100.0)),
-        "category": adv.get("category", "TS"),
-        "issued_at": adv.get("issued_at", ""),
-        "active": bool(adv.get("active", True)),
-    }
+    state["advisory_raw"] = raw
     state["advisory"] = adv_norm
-    state["active"] = adv_norm["active"]
+    state["active"] = bool(adv_norm.get("active", True))
+    dbg_all = state.setdefault("debug", {})
+    dbg_all.update(dbg)
+
     timings["watcher_ms_read"] = (time.perf_counter() - t0) * 1000.0
 
+# --- replace your existing _step_analyze_risk with this ---
 def _step_analyze_risk(state: Dict[str, Any], zip_code: str, timings: Dict[str, float]) -> None:
     t0 = time.perf_counter()
-    adv = state.get("advisory") or {}
 
-    if not adv:
-        state["analysis"] = {"risk": "ERROR", "reason": "No advisory data"}
+    adv = state.get("advisory")
+    if not isinstance(adv, dict):
+        state["analysis"] = {"risk": "ERROR", "reason": "No advisory loaded"}
         timings["watcher_ms_analyze"] = (time.perf_counter() - t0) * 1000.0
         return
 
+    center = adv.get("center")
+    radius_km = adv.get("radius_km")
+    if not isinstance(center, dict) or "lat" not in center or "lon" not in center:
+        state["analysis"] = {"risk": "ERROR", "reason": "Advisory missing center.lat/lon"}
+        timings["watcher_ms_analyze"] = (time.perf_counter() - t0) * 1000.0
+        return
+    if radius_km is None:
+        state["analysis"] = {"risk": "ERROR", "reason": "Advisory missing radius_km"}
+        timings["watcher_ms_analyze"] = (time.perf_counter() - t0) * 1000.0
+        return
+
+    # Resolve ZIP
     coords = _resolve_zip_latlon(zip_code)
     if coords is None:
-        reason = "pgeocode not installed" if not _PGEOCODE_AVAILABLE else f"Unknown ZIP {zip_code}"
+        reason = "pgeocode not installed" if not _PGEOCODE_OK else f"Unknown ZIP {zip_code}"
         state["analysis"] = {"risk": "ERROR", "reason": reason}
         timings["watcher_ms_analyze"] = (time.perf_counter() - t0) * 1000.0
         return
 
     zlat, zlon = coords
-    clat, clon = float(adv["center"]["lat"]), float(adv["center"]["lon"])
+    clat, clon = float(center["lat"]), float(center["lon"])
     dist_km = _haversine_km(zlat, zlon, clat, clon)
-    radius_km = float(adv["radius_km"])
-    inside = dist_km <= radius_km
-    risk = _risk_heuristic(dist_km, radius_km, str(adv.get("category", "")))
+    r_km = float(radius_km)
+    inside = dist_km <= r_km
+    risk = _risk_heuristic(dist_km, r_km, str(adv.get("category", "")))
 
     state["zip_point"] = {"lat": zlat, "lon": zlon}
-    state["analysis"] = {"risk": risk, "distance_km": round(dist_km, 1)}
-    state["watcher_text"] = _fmt_watch_text(zip_code, risk, dist_km, inside, radius_km)
+    state["analysis"]  = {"risk": risk, "distance_km": round(dist_km, 1)}
+    state["watcher_text"] = _fmt_watch_text(zip_code, risk, dist_km, inside, r_km)
+
     timings["watcher_ms_analyze"] = (time.perf_counter() - t0) * 1000.0
 
-def _step_explain_risk(state: Dict[str, Any], zip_code: str, timings: Dict[str, float]) -> None:
-    """AI-only explainer with nonce proof: the model must return JSON containing the exact nonce."""
+
+# ---------- Step 3: AI explainer ----------
+def _clean_explainer(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    out = s.strip()
+    if out.startswith("🧠 AI:"):
+        out = out[len("🧠 AI:"):].strip()
+    if out.lower().startswith("ai:"):
+        out = out[3:].strip()
+    return " ".join(out.split())
+
+def _step_ai_explainer(state: Dict[str, Any], zip_code: str, timings: Dict[str, float]) -> None:
     t0 = time.perf_counter()
+
     adv = state.get("advisory") or {}
     analysis = state.get("analysis") or {}
-
     if not adv or not analysis or analysis.get("risk") in (None, "ERROR"):
-        return
-    if not bool(state.get("active", True)):
+        timings["explainer_ms"] = (time.perf_counter() - t0) * 1000.0
         return
 
     risk = str(analysis.get("risk", ""))
     dist_km = analysis.get("distance_km", "")
-    radius_km = (adv or {}).get("radius_km", "")
-    category = (adv or {}).get("category", "")
+    radius_km = adv.get("radius_km", "")
+    category = adv.get("category", "")
 
-    # --- Generate a per-call nonce and store it in debug so you can inspect later
-    nonce = secrets.token_hex(4)  # e.g., 'a3f9c1b2'
-    dbg = state.setdefault("debug", {})
-    dbg["risk_explainer_nonce"] = nonce
-
-    # --- Prompt requires strict, minified JSON with the nonce echoed in "proof"
+    agent = build_risk_explainer_agent()
     prompt = (
-        "You are a hurricane risk explainer. You will be given ZIP, risk, distance (km), advisory radius (km), and category.\n"
-        "Respond with STRICT MINIFIED JSON(no code fences, no extra text):\n"
-        f'{{"AI: <ONE sentence (<=25 words) explaining the risk>",'
-        f'"proof":"{nonce}"}}\n'
-        "Rules:\n"
-        "- Length <= 25 words.\n"
-        "- Return ONLY the JSON object (minified). No markdown, no explanations."
-        f"\n\nZIP: {zip_code}\nRISK: {risk}\nDIST_KM: {dist_km}\nRADIUS_KM: {radius_km}\nCATEGORY: {category}"
+        "Explain hurricane risk in one sentence (<=25 words), plain text only.\n"
+        "Facts:\n"
+        f"- zip: {zip_code}\n"
+        f"- risk: {risk}\n"
+        f"- distance_km: {dist_km}\n"
+        f"- radius_km: {radius_km}\n"
+        f"- category: {category}\n"
+        "Respond ONLY with the sentence. No emojis, no prefixes.\n"
     )
 
-    # Try ADK first, then direct SDKs; do NOT fabricate fallback text
-    raw_text, ev_summ, err_str, backend = _call_risk_explainer_ai(prompt)
+    text, events, err = run_llm_agent_text_debug(
+        agent, prompt,
+        app_name="hurri_aid",
+        user_id="ui_user",
+        session_id="sess_explainer"
+    )
 
-    used_ai = False
-    text: Optional[str] = None
+    dbg = state.setdefault("debug", {})
+    dbg["explainer_prompt"] = prompt
+    dbg["explainer_events"] = events
+    dbg["explainer_error"] = err
+    dbg["explainer_raw"] = text
 
-    # Parse and validate proof
-    data = _json_from_text(raw_text) if raw_text else None
-    if isinstance(data, dict) and data.get("proof") == nonce and isinstance(data.get("why"), str):
-        candidate = data["why"].strip()
-        # Only check length; no prefix requirement
-        if len(candidate.split()) <= 28:
-            text = candidate
-            used_ai = True
-        else:
-            err_str = err_str or "AI_PROOF_OK_BUT_TOO_LONG"
-    else:
-        err_str = err_str or "AI_PROOF_FAIL"
-
-
-    # Outputs + debug (AI-only; if invalid, text stays None)
-    state["risk_explainer"] = text
-    state.setdefault("flags", {})["risk_explainer_ai"] = used_ai
-
-    dbg["risk_explainer_raw"] = raw_text
-    dbg["risk_explainer_prompt"] = prompt
-    dbg["risk_explainer_events"] = ev_summ
-    dbg["risk_explainer_backend"] = backend  # 'ADK' | 'GENAI:new' | 'GENAI:old' | 'NONE'
-    if err_str:
-        dbg["risk_explainer_error"] = err_str
+    final = _clean_explainer(text or "")
+    # Per requirement: rely solely on AI (no deterministic fallback)
+    state["risk_explainer"] = final if final else None
+    state["analysis_explainer"] = state.get("risk_explainer")
 
     timings["explainer_ms"] = (time.perf_counter() - t0) * 1000.0
 
-
-# ---------- Public API used by Coordinator/UI ----------
-
+# ---------- public entry point ----------
 def run_watcher_once(data_dir: str, zip_code: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Streamlit-friendly, deterministic single pass:
-      - read advisory
-      - compute risk
-      - generate AI explainer (or fallback)
-    Returns (state, timings).
-    """
-    t0 = time.perf_counter()
+    T0 = time.perf_counter()
     state: Dict[str, Any] = {}
     timings: Dict[str, float] = {}
 
     _step_read_advisory(state, data_dir, timings)
+
+    # NEW: if advisory step flagged an error, don’t proceed
+    if (state.get("analysis") or {}).get("risk") == "ERROR" or "advisory" not in state:
+        timings["watcher_ms"] = timings.get("watcher_ms_read", 0.0)
+        timings["watcher_ms_total"] = (time.perf_counter() - T0) * 1000.0
+        state["timings_ms"] = timings
+        return state, timings
+
     _step_analyze_risk(state, zip_code, timings)
-    _step_explain_risk(state, zip_code, timings)
+    _step_ai_explainer(state, zip_code, timings)
 
-    # Aggregate timings
     timings["watcher_ms"] = timings.get("watcher_ms_read", 0.0) + timings.get("watcher_ms_analyze", 0.0)
-    timings["watcher_ms_total"] = (time.perf_counter() - t0) * 1000.0
+    timings["watcher_ms_total"] = (time.perf_counter() - T0) * 1000.0
     state["timings_ms"] = timings
-
-    # Safety net so UI never sees an empty analysis
     state.setdefault("analysis", {"risk": "ERROR", "reason": "Watcher produced no analysis"})
     return state, timings

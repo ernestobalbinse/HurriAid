@@ -1,8 +1,9 @@
 # core/adk_helpers.py
 from __future__ import annotations
 from typing import Optional, List, Tuple
+import asyncio, inspect
 
-# Try ADK + GenAI imports once and cache a flag
+# ADK + GenAI (ADK path)
 try:
     from google.adk.runners import Runner
     from google.adk.sessions import InMemorySessionService
@@ -10,6 +11,29 @@ try:
     _ADK_OK = True
 except Exception:
     _ADK_OK = False
+
+
+def _ensure_session_sync(session_service: "InMemorySessionService",
+                         app_name: str, user_id: str, session_id: str) -> None:
+    """
+    Create the ADK session, awaiting if the API is async on this version.
+    Safe to call from synchronous code.
+    """
+    try:
+        res = session_service.create_session(app_name=app_name, user_id=user_id, session_id=session_id)
+        if inspect.isawaitable(res):
+            # No loop in Streamlit main thread: use asyncio.run; else, make a temporary loop.
+            try:
+                asyncio.run(res)
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(res)
+                finally:
+                    loop.close()
+    except Exception:
+        # If it already exists or the API signature changed, ignore; Runner will error if truly missing.
+        pass
 
 
 def run_llm_agent_text(agent, prompt: str,
@@ -38,7 +62,9 @@ def run_llm_agent_text_debug(agent, prompt: str,
 
     try:
         session_service = InMemorySessionService()
-        session_service.create_session(app_name=app_name, user_id=user_id, session_id=session_id)
+        # IMPORTANT: ensure the session exists for the exact session_id we will use with Runner.run
+        _ensure_session_sync(session_service, app_name=app_name, user_id=user_id, session_id=session_id)
+
         runner = Runner(agent=agent, app_name=app_name, session_service=session_service)
 
         content = types.Content(role="user", parts=[types.Part(text=prompt)])
@@ -77,5 +103,6 @@ def run_llm_agent_text_debug(agent, prompt: str,
             return None, summaries, "NO_EVENTS"
 
         return final_text, summaries, None
+
     except Exception as e:
         return None, [], f"{type(e).__name__}: {e}"

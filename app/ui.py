@@ -1,5 +1,5 @@
 # ---- Standard library ----
-import sys, os
+import sys, os, hashlib
 from datetime import datetime
 from urllib.parse import urlencode
 
@@ -104,7 +104,7 @@ components.html("""
 # --- Title placeholder (persists across quick reruns so it doesn't "disappear") ---
 _title_box = st.container()
 
-# ---------------- Sidebar (no Live Watcher) ----------------
+# ---------------- Sidebar ----------------
 zip_code = st.sidebar.text_input("Enter ZIP code", value=st.session_state.get(zip_key, "33101"), key=zip_key)
 update_now = st.sidebar.button("Update Now", key=f"{APP_NS}_update")
 
@@ -112,11 +112,13 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("Settings")
 show_map = st.sidebar.toggle("Show Map", value=True, key=f"{APP_NS}_show_map")
 show_verifier = st.sidebar.toggle("Show Verifier", value=True, key=f"{APP_NS}_show_verifier")
+always_run = st.sidebar.toggle("Force run on every rerun", value=False, key=f"{APP_NS}_always_run")
 
 # ---------------- Coordinator (ADK mandatory) ----------------
 if "coordinator" not in st.session_state:
     try:
-        st.session_state.coordinator = Coordinator(data_dir="data")
+        # IMPORTANT: point to <repo-root>/data (not app/data)
+        st.session_state.coordinator = Coordinator(data_dir=os.path.join(ROOT, "data"))
         st.session_state.adk_error = None
     except ADKNotAvailable as e:
         st.session_state.coordinator = None
@@ -134,14 +136,47 @@ if "persisted_history" not in st.session_state:
     except Exception:
         st.session_state.persisted_history = []
 
-# ---------------- Run triggers (manual only) ----------------
+# ---------------- Advisory file path / change detection ----------------
+def _advisory_path():
+    return os.path.join(ROOT, "data", "sample_advisory.json")
+
+def _advisory_mtime():
+    try:
+        return os.path.getmtime(_advisory_path())
+    except Exception:
+        return None
+
+def _advisory_sig():
+    path = _advisory_path()
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except Exception:
+        return None
+
+prev_mtime = st.session_state.get(f"{APP_NS}_adv_mtime")
+curr_mtime = _advisory_mtime()
+prev_sig = st.session_state.get(f"{APP_NS}_adv_sig")
+curr_sig = _advisory_sig()
+
+file_changed = ((curr_mtime is not None and curr_mtime != prev_mtime) or
+                (curr_sig is not None and curr_sig != prev_sig))
+
+# update stored trackers
+if curr_mtime is not None:
+    st.session_state[f"{APP_NS}_adv_mtime"] = curr_mtime
+if curr_sig is not None:
+    st.session_state[f"{APP_NS}_adv_sig"] = curr_sig
+
+# ---------------- Run triggers (manual + file change + zip change + optional force) ----------------
 zip_changed = (st.session_state.get("last_zip") != zip_code)
-should_run = ("last_result" not in st.session_state) or update_now or zip_changed
+should_run = True if always_run else (("last_result" not in st.session_state) or update_now or zip_changed or file_changed)
 
 if should_run:
     if coord is None:
         st.error("Coordinator not available (ADK error).")
         st.stop()
+
     result = coord.run_once(zip_code)
     st.session_state.last_result = result
     st.session_state.last_zip = zip_code
@@ -150,11 +185,13 @@ if should_run:
     # History row
     hist = st.session_state.get("history", [])
     adk_ok = not st.session_state.get("adk_error")
+    analysis = (result.get("analysis") or {})
+    plan = result.get("plan") or {}
     hist.append({
         "time": st.session_state.last_run,
         "zip": zip_code,
-        "risk": (result.get("analysis") or {}).get("risk", "—"),
-        "eta": (result.get("plan") or {}).get("eta_min", "—"),
+        "risk": analysis.get("risk", "—"),
+        "eta": plan.get("eta_min", "—"),
         "llm": "Gemini",
         "adk": "ON" if adk_ok else "ERROR",
     })
@@ -213,6 +250,10 @@ col_left, col_mid, col_map = st.columns([0.9, 1.1, 1.6], gap="large")
 
 with col_left:
     st.subheader("Risk")
+    active = bool(advisory.get("active", True))
+    if not active:
+        st.info("No active hurricane. Watcher is paused for this ZIP.")
+        st.stop()
     if analysis:
         if analysis.get("risk") == "ERROR":
             st.error(analysis.get("reason", "Unknown ZIP — cannot assess risk."))
@@ -220,6 +261,7 @@ with col_left:
             risk_txt = analysis.get("risk", "—")
             dist_km = analysis.get("distance_km")
             radius_km = (advisory or {}).get("radius_km")
+
             bullets = [
                 f"- **ZIP:** `{zip_code}`",
                 f"- **Risk:** **{risk_txt}**",
@@ -231,14 +273,10 @@ with col_left:
                 bullets.append(f"- **Advisory area:** {where} (radius ≈ {float(radius_km):.1f} km)")
             st.markdown("\n".join(bullets))
 
-    # --- AI explainer (one sentence) ---
-    expl = result.get("analysis_explainer")
-    if isinstance(expl, str) and expl.strip():
-        st.caption(f"Why: {expl}")
-    
-    
-
-
+            # AI explainer (validated upstream)
+            why = result.get("analysis_explainer") or result.get("risk_explainer")
+            if isinstance(why, str) and why.strip():
+                st.markdown(f"**Why:** {why}")
     else:
         st.info("Risk analysis unavailable.")
 
@@ -433,10 +471,8 @@ if show_verifier:
 with st.expander("Advisory (details)", expanded=False):
     if advisory:
         st.json(advisory)
-        issued_at = (advisory or {}).get("issued_at", "")
-        fresh_status, fresh_detail = compute_freshness(issued_at)
-        if issued_at:
-            st.caption(f"Issued at: {issued_at} — Last update: {fresh_detail}")
+        dbg = result.get("debug") or {}
+        ui_path = os.path.join(ROOT, "data", "sample_advisory.json")
     else:
         st.caption("No advisory data.")
 
@@ -450,39 +486,65 @@ def _fmt_ms(v):
 with st.expander("Agent Status", expanded=False):
     status_lines = [
         f"Watcher: {_fmt_ms(timings.get('watcher_ms'))} ms" + (f" | ERROR: {errors['watcher']}" if 'watcher' in errors else ""),
-        f"Analyzer: {_fmt_ms(timings.get('analyzer_ms'))} ms" + (f" | ERROR: {errors['analyzer']}" if 'analyzer' in errors else ""),
+        f"Analyzer: {_fmt_ms(timings.get('watcher_ms_analyze'))} ms" + (f" | ERROR: {errors['analyzer']}" if 'analyzer' in errors else ""),
         f"Planner:  {_fmt_ms(timings.get('planner_ms'))} ms"  + (f" | ERROR: {errors['planner']}" if 'planner' in errors else ""),
         f"Parallel: {_fmt_ms(timings.get('parallel_ms'))} ms",
         f"Total:    {_fmt_ms(timings.get('total_ms'))} ms (ran at {st.session_state.get('last_run', '—')})",
     ]
-    origin = "AI" if (result.get('flags', {}).get('risk_explainer_ai')) else "fallback"
-    status_lines.insert(3, f"Explainer: {_fmt_ms(timings.get('explainer_ms'))} ms | {origin}")
-
+    if 'explainer_ms' in timings:
+        status_lines.insert(1, f"Explainer: {_fmt_ms(timings.get('explainer_ms'))} ms")
     st.code("\n".join(status_lines), language="text")
 
-# --- History (collapsible) ---
-import pandas as pd
-with st.expander("History", expanded=False):
-    raw_hist = st.session_state.get("history", [])
-    if raw_hist:
-        display_rows = []
-        for r in raw_hist:
-            display_rows.append({
-                "time": r.get("time", "—"),
-                "zip": r.get("zip", "—"),
-                "risk": r.get("risk", "—"),
-                "eta": "—" if r.get("eta") in (None, "—") else str(r.get("eta")),
-                "adk": r.get("adk", "—"),
-            })
-        df = pd.DataFrame(display_rows, columns=["time", "zip", "risk", "eta", "adk"])
-        st.dataframe(df, hide_index=True, use_container_width=True)
-        c1, c2 = st.columns([1, 6])
-        with c1:
-            if st.button("Clear history", key=f"{APP_NS}_clear_history"):
-                st.session_state["history"] = []
-                st.success("History cleared.")
-                st.rerun()
-        with c2:
-            st.caption(f"{len(raw_hist)} run(s) in this session.")
+with st.expander("Advisory (details)", expanded=False):
+    if advisory:
+        st.json(advisory)
+
+        # NEW: show exactly what the watcher parsed from JSON
+        advisory_raw = result.get("advisory_raw")
+        if advisory_raw is not None:
+            st.caption("Raw advisory as parsed:")
+            st.json(advisory_raw)
+
+        # NEW: show exact on-disk file contents (first 1000 chars)
+        ui_path = os.path.join(ROOT, "data", "sample_advisory.json")
+        try:
+            with open(ui_path, "r", encoding="utf-8") as f:
+                raw_text_preview = f.read(1000)
+            st.caption("On-disk file preview (first 1000 chars):")
+            st.code(raw_text_preview, language="json")
+        except Exception as e:
+            st.caption(f"Could not read file preview: {e}")
+
+        # Existing debug lines…
+        dbg = result.get("debug") or {}
+        wpath = dbg.get("advisory_path")
+        wsha  = dbg.get("advisory_sha256")
+        st.caption(f"UI file:  {ui_path}")
+        if wpath:
+            st.caption(f"Watcher file: {wpath}")
+        if wsha:
+            st.caption(f"Watcher content hash (sha256, first 12): {wsha[:12]}")
+
+        # NEW: show radius source + raw value
+        src = dbg.get("advisory_radius_source")
+        raw_val = dbg.get("advisory_radius_raw_value")
+        if src:
+            st.caption(f"radius_km source: {src} (raw value: {raw_val})")
+
+        # Keep your mtime/hash/freshness lines…
+        path = ui_path
+        st.caption(f"File: {path}")
+        try:
+            st.caption(f"Last modified: {datetime.fromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d %H:%M:%S')}")
+        except Exception:
+            pass
+        sig = st.session_state.get(f"{APP_NS}_adv_sig")
+        if sig:
+            st.caption(f"Content hash (sha256, first 12): {sig[:12]}")
+
+        # Show the exact prompt the AI used (you already have this)
+        if dbg.get("explainer_prompt"):
+            st.caption("Explainer prompt (exact):")
+            st.code(dbg["explainer_prompt"], language="text")
     else:
-        st.caption("No session runs yet.")
+        st.caption("No advisory data.")

@@ -1,10 +1,7 @@
-﻿{
-    "active":  true,
-    "center":  {
-                   "lat":  25.77,
-                   "lon":  -80.19
-               },
-    "issued_at":  "2025-09-28T00:15:00Z",
-    "radius_km":  100,
-    "category":  "CAT2"
+{
+  "active": true,
+  "issued_at": "2025-09-28T04:20:00Z",
+  "category": "TS",
+  "radius_km": 120,
+  "center": { "lat": 25.774, "lon": -80.19 }
 }
