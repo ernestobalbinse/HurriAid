@@ -1,4 +1,4 @@
-# agents/coordinator.py
+# agents/coordinator.py — pgeocode ZIP + JSON advisory/shelters, map-friendly outputs
 from __future__ import annotations
 from typing import Dict, Any
 from time import perf_counter
@@ -7,86 +7,77 @@ from agents.watcher import Watcher
 from agents.analyzer import assess_risk
 from agents.planner import nearest_open_shelter
 from agents.communicator import build_checklist
-from agents.verifier_llm import verify_items_with_llm
-from core.parallel_exec import ParallelRunner, ADKNotAvailable
+# If you previously removed ParallelRunner, keep your current runner;
+# this version runs analyzer/planner sequentially for simplicity/stability.
+# from core.parallel_exec import ParallelRunner, ADKNotAvailable
 
 
 class Coordinator:
     def __init__(self, data_dir: str = "data"):
         self.data_dir = data_dir
-        self.watcher = Watcher(data_dir=data_dir)
-        self.runner = ParallelRunner(max_workers=3)
+        self.watcher = Watcher(data_dir=data_dir, fl_only=True)
 
     def run_once(self, zip_code: str) -> Dict[str, Any]:
         timings: Dict[str, float] = {}
         errors: Dict[str, str] = {}
+        result: Dict[str, Any] = {}
 
-        # --- overall wall-clock start
-        t_all0 = perf_counter()
-
-        # 1) Load data
+        # 1) Load advisory & shelters
         t0 = perf_counter()
         try:
             advisory = self.watcher.get_advisory()
-            zip_centroids = self.watcher.get_zip_centroids()
+        except Exception as e:
+            advisory = {}
+            errors["watcher"] = f"Advisory: {e}"
+        try:
             shelters = self.watcher.get_shelters()
         except Exception as e:
-            advisory, zip_centroids, shelters = {}, {}, []
-            errors["watcher"] = str(e)
+            shelters = []
+            errors["watcher"] = (errors.get("watcher", "") + f" | Shelters: {e}").strip()
         timings["watcher_ms"] = round((perf_counter() - t0) * 1000.0, 2)
 
-        # 2) Prepare tasks
-        def _analyze():
-            return assess_risk(zip_code, advisory, zip_centroids)
+        # 2) Analyzer (uses watcher for reliable zip centroid)
+        t1 = perf_counter()
+        try:
+            analysis = assess_risk(zip_code, advisory, self.watcher)
+        except Exception as e:
+            analysis = {"risk": "ERROR", "reason": str(e)}
+            errors["analyzer"] = str(e)
+        timings["analyzer_ms"] = round((perf_counter() - t1) * 1000.0, 2)
 
-        def _plan():
-            return nearest_open_shelter(zip_code, zip_centroids, shelters)
+        # 3) Planner (uses watcher + shelters)
+        t2 = perf_counter()
+        try:
+            plan = None if analysis.get("risk") == "ERROR" else nearest_open_shelter(zip_code, self.watcher, shelters)
+        except Exception as e:
+            plan = None
+            errors["planner"] = str(e)
+        timings["planner_ms"] = round((perf_counter() - t2) * 1000.0, 2)
 
-        # Keep the LLM out of the critical path unless you really need it
-        def _verify_llm():
-            base_items = [
-                "Open windows during hurricane",
-                "Drink water",
-                "Taping windows prevents shattering",
-            ]
-            return verify_items_with_llm(base_items)
+        # 4) Checklist derived from analysis
+        checklist = build_checklist(analysis)
 
-        # 3) Run tasks in parallel
-        t_par0 = perf_counter()
-        results, par_timings, par_errors = self.runner.run({
-            "analyzer": _analyze,
-            "planner": _plan,
-            # Comment this line if you want zero LLM cost here:
-            "verifier_llm": _verify_llm,
-        })
-        t_par1 = perf_counter()
+        # 5) zip_point for UI map (even if analyzer errored, try to provide a point)
+        try:
+            zp = self.watcher.get_zip_centroid(zip_code)
+            zip_point = {"lat": zp["lat"], "lon": zp["lon"]}
+        except Exception:
+            zip_point = None
 
-        # Merge timings/errors
-        timings.update(par_timings or {})
-        errors.update(par_errors or {})
-
-        # If runner didn't provide a parallel wall time, compute a safe fallback
-        if "parallel_ms" not in timings:
-            timings["parallel_ms"] = round((t_par1 - t_par0) * 1000.0, 2)
-
-        # 4) Fan-in
-        analysis   = results.get("analyzer") or {}
-        plan       = results.get("planner")
-        verify_llm = results.get("verifier_llm") or {"overall": "CLEAR", "matches": []}
-        checklist  = build_checklist(analysis)
-
-        # --- overall wall-clock end / total
-        timings["total_ms"] = round((perf_counter() - t_all0) * 1000.0, 2)
+        # Total timing (simple sum since sequential here)
+        timings["total_ms"] = round(sum([
+            timings.get("watcher_ms", 0.0),
+            timings.get("analyzer_ms", 0.0),
+            timings.get("planner_ms", 0.0),
+        ]), 2)
 
         return {
-            "advisory": advisory,
+            "advisory": advisory,          # <-- has "center" + "radius_km" for the map
             "analysis": analysis,
             "plan": plan,
             "checklist": checklist,
-            "verify": verify_llm,
-            "zip_valid": True,
-            "zip_message": "",
-            "zip_point": zip_centroids.get(zip_code) if isinstance(zip_centroids, dict) else None,
+            "verify": {"overall": "CLEAR", "matches": []},  # UI triggers LLM manually; no background calls
+            "zip_point": zip_point,        # <-- {lat, lon} for the UI dot
             "timings_ms": timings,
             "errors": errors,
         }

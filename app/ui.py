@@ -242,7 +242,6 @@ with col_left:
     if analysis:
         if analysis.get("risk") == "ERROR":
             st.error(analysis.get("reason", "Unknown ZIP — cannot assess risk."))
-            st.stop()
         else:
             risk_txt = analysis.get("risk", "—")
             dist_km = analysis.get("distance_km")
