@@ -1,64 +1,62 @@
 # app/ui.py
-# ---- Standard library ----
+# --- Standard library ---
 import sys, os, hashlib
 from datetime import datetime
 from urllib.parse import urlencode
 from core.units import km_to_mi
 
-
-# ---- Third-party ----
+# --- Streamlit ---
 import streamlit as st
 import streamlit.components.v1 as components
 st.set_page_config(page_title="HurriAid", layout="wide", initial_sidebar_state="expanded")
 import pydeck as pdk
 
-# --- repo root on sys.path so 'core', 'agents', 'tools' resolve when run from app/ ---
+# Make sure imports resolve when we run from app/
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-# ---- Project modules ----
-from core.parallel_exec import ADKNotAvailable
+# --- Project modules ---
 from core.ui_helpers import badge, compute_freshness
 from core.utils import load_history
 from tools.geo import circle_polygon
 from agents.coordinator import Coordinator
 from agents.verifier_llm import verify_items_with_llm
 
-# Load .env early so env vars are available
+# Load .env early so GOOGLE_API_KEY are available
 try:
     from dotenv import load_dotenv  # pip install python-dotenv
     load_dotenv()
 except Exception:
     pass
 
-# --- Namespace used for all widget/session keys ---
+# Everything in the UI stores state under this namespace
 APP_NS = "v8"
 
-# --- Runtime sanity check (AI Studio only) ---
+# Hard requirement: we always use AI. If the key is missing, stop with a clear nudge.
 if not os.getenv("GOOGLE_API_KEY"):
     st.error(
-        "AI Studio key missing. Set GOOGLE_API_KEY or create a .env with GOOGLE_API_KEY=YOUR_KEY.\n\n"
-        "Windows PowerShell example:\n"
+        "Missing GOOGLE_API_KEY. Add it to your environment or a local .env file.\n\n"
+        "PowerShell example:\n"
         '$env:GOOGLE_GENAI_USE_VERTEXAI = "FALSE"\n'
         '$env:GOOGLE_API_KEY = "<YOUR_KEY>"\n'
     )
     st.stop()
 
-# --- Apply any pending ZIP change BEFORE the text_input widget is created ---
+# If a ZIP change was staged before this rerun, apply it now (prevents flicker).
 _pending_key = f"{APP_NS}_pending_zip"
 zip_key = f"{APP_NS}_zip"
 if _pending_key in st.session_state:
     st.session_state[zip_key] = st.session_state[_pending_key]
     del st.session_state[_pending_key]
 
-# --- Global style tweaks + remove form box for Rumor Check ---
+# Small CSS reset and form cleanup so the page looks calm and uncluttered
 st.markdown("""
 <style>
 section.main > div { padding-top: 0.5rem !important; }
 .main .block-container { padding-top: 0.5rem !important; }
 .block-container { padding-top: 0.5rem !important; }
-/* Remove the card/border/shadow around the AI Rumor Check form */
+/* Make the Rumor Check form feel native to the page (no card chrome) */
 form[data-testid="stForm"],
 section[data-testid="stForm"],
 div[data-testid="stForm"]{
@@ -77,7 +75,7 @@ div[data-testid="stForm"] > div{
 </style>
 """, unsafe_allow_html=True)
 
-# --- Keep page position (stop jumping to top on rerun) ---
+# Keep scroll position across quick reruns so the page doesn't jump
 components.html("""
 <script>
 (function(){
@@ -104,7 +102,7 @@ components.html("""
 </script>
 """, height=0)
 
-# --- Title placeholder (persists across quick reruns so it doesn't "disappear") ---
+# Title stays mounted so it doesn't flash on quick reruns
 _title_box = st.container()
 
 # ---------------- Sidebar ----------------
@@ -116,29 +114,25 @@ st.sidebar.subheader("Settings")
 show_map = st.sidebar.toggle("Show Map", value=True, key=f"{APP_NS}_show_map")
 show_verifier = st.sidebar.toggle("Show Verifier", value=True, key=f"{APP_NS}_show_verifier")
 
-# ---------------- Coordinator (ADK mandatory) ----------------
+# ---------------- Coordinator ----------------
+# Straightforward: we always run with AI. If construction fails, tell the user and stop.
 if "coordinator" not in st.session_state:
     try:
-        # IMPORTANT: point to <repo-root>/data (not app/data)
         st.session_state.coordinator = Coordinator(data_dir=os.path.join(ROOT, "data"))
-        st.session_state.adk_error = None
-    except ADKNotAvailable as e:
-        st.session_state.coordinator = None
-        st.session_state.adk_error = str(e)
+    except Exception as e:
+        st.error(f"Setup error: {e}")
+        st.stop()
 
 coord = st.session_state.coordinator
-if st.session_state.get("adk_error"):
-    st.error("Google ADK is required: " + st.session_state["adk_error"])
-    st.stop()
 
-# ---------------- Persisted history ----------------
+# ---------------- Persisted history for the session ----------------
 if "persisted_history" not in st.session_state:
     try:
         st.session_state.persisted_history = load_history()
     except Exception:
         st.session_state.persisted_history = []
 
-# ---------------- Advisory file change detection ----------------
+# --- Quick helpers for advisory file change detection ---
 def _advisory_path():
     return os.path.join(ROOT, "data", "sample_advisory.json")
 
@@ -158,57 +152,44 @@ def _advisory_sig():
 
 prev_mtime = st.session_state.get(f"{APP_NS}_adv_mtime")
 curr_mtime = _advisory_mtime()
-prev_sig = st.session_state.get(f"{APP_NS}_adv_sig")
-curr_sig = _advisory_sig()
-
+prev_sig   = st.session_state.get(f"{APP_NS}_adv_sig")
+curr_sig   = _advisory_sig()
 file_changed = ((curr_mtime is not None and curr_mtime != prev_mtime) or
                 (curr_sig is not None and curr_sig != prev_sig))
 
-# update stored trackers
 if curr_mtime is not None:
     st.session_state[f"{APP_NS}_adv_mtime"] = curr_mtime
 if curr_sig is not None:
     st.session_state[f"{APP_NS}_adv_sig"] = curr_sig
 
-# ---------------- Run triggers (manual + file change + zip change) ----------------
+# We re-run when: user clicks refresh, ZIP changes, or the advisory file updates
 zip_changed = (st.session_state.get("last_zip") != zip_code)
 should_run = ("last_result" not in st.session_state) or update_now or zip_changed or file_changed
 
 if should_run:
-    if coord is None:
-        st.error("Coordinator not available (ADK error).")
-        st.stop()
-
     res = coord.run_once(zip_code)
-
-    # Always store a dict so UI never crashes
-    if not isinstance(res, dict):
+    if not isinstance(res, dict):  # belt + suspenders: guarantee a dict to the UI
         res = {"errors": {"coordinator": "Coordinator.run_once returned None"}, "timings_ms": {}}
 
     st.session_state.last_result = res
     st.session_state.last_zip = zip_code
     st.session_state.last_run = datetime.now().strftime("%H:%M:%S")
 
-    # History row
-    hist = st.session_state.get("history", [])
-    adk_ok = not st.session_state.get("adk_error")
+    # Light history we can show/debug later
     analysis = (res.get("analysis") or {})
     plan = res.get("plan") or {}
+    hist = st.session_state.get("history", [])
     hist.append({
         "time": st.session_state.last_run,
         "zip": zip_code,
         "risk": analysis.get("risk", "—"),
         "eta": plan.get("eta_min", "—"),
         "llm": "Google Gemini",
-        "adk": "ON" if adk_ok else "ERROR",
     })
     st.session_state["history"] = hist[-12:]
 
 # ---------------- Unpack result ----------------
-result = st.session_state.get("last_result") or {}
-if not isinstance(result, dict):
-    result = {}
-
+result    = st.session_state.get("last_result") or {}
 advisory  = result.get("advisory") or {}
 analysis  = result.get("analysis") or {}
 plan      = result.get("plan") or {}
@@ -217,16 +198,12 @@ timings   = result.get("timings_ms") or {}
 errors    = result.get("errors") or {}
 zip_point = result.get("zip_point")
 
-if errors.get("adk"):
-    st.error("Google ADK is required: " + errors["adk"])
-    st.stop()
-
 # ---------------- Header (persistent) ----------------
 with _title_box:
     st.markdown("<h1 style='margin:0'>HurriAid</h1>", unsafe_allow_html=True)
     st.caption(f"Last opened: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# Chips row
+# Status chips along the top: risk, advisory freshness, model
 chips = []
 risk_val = (analysis or {}).get("risk", "—")
 if risk_val == "HIGH":
@@ -258,30 +235,29 @@ st.markdown(" ".join(chips), unsafe_allow_html=True)
 # ---------- GRID LAYOUT ----------
 col_left, col_mid, col_map = st.columns([0.9, 1.1, 1.6], gap="large")
 
+# LEFT: Risk panel
 with col_left:
-    st.subheader("Risk -")
+    st.subheader("Risk")
     active = bool(advisory.get("active", True))
     if not active:
-        st.info("No active hurricane. Watcher is paused for this ZIP.")
+        st.info("No active hurricane. Monitoring is paused for this ZIP.")
     elif analysis:
         if analysis.get("risk") == "ERROR":
-            st.error(analysis.get("reason", "Unknown ZIP — cannot assess risk."))
+            st.error(analysis.get("reason", "We couldn’t assess the risk for this ZIP."))
         else:
-            risk_txt = analysis.get("risk", "—")
-            dist_km = analysis.get("distance_km")
+            risk_txt  = analysis.get("risk", "—")
+            dist_km   = analysis.get("distance_km")
             radius_km = (advisory or {}).get("radius_km")
 
             bullets = [
                 f"- **ZIP:** `{zip_code}`",
                 f"- **Risk:** **{risk_txt}**",
             ]
-            
-            dist_km = analysis.get("distance_km")
+
             dist_mi = analysis.get("distance_mi") or (km_to_mi(dist_km) if isinstance(dist_km, (int, float)) else None)
-            radius_km = (advisory or {}).get("radius_km")
             radius_mi = (advisory or {}).get("radius_mi") or (km_to_mi(radius_km) if isinstance(radius_km, (int, float)) else None)
 
-            if isinstance(dist_mi, (int, float,)) or isinstance(dist_mi, float):
+            if isinstance(dist_mi, (int, float)):
                 bullets.append(f"- **Distance to storm center:** {float(dist_mi):.1f} mi")
 
             if isinstance(dist_km, (int, float)) and isinstance(radius_km, (int, float)):
@@ -289,38 +265,33 @@ with col_left:
                 if isinstance(radius_mi, (int, float)):
                     bullets.append(f"- **Advisory area:** {where} (radius ≈ {float(radius_mi):.1f} mi)")
                 else:
-                    # fallback if radius_mi not present
                     bullets.append(f"- **Advisory area:** {where}")
+
             st.markdown("\n".join(bullets))
 
-            # AI explainer
+            # One-liner from the model on why this risk level applies
             why = result.get("analysis_explainer") or result.get("risk_explainer")
             if isinstance(why, str) and why.strip():
                 st.markdown(f"**Why:** {why}")
     else:
-        st.info("Risk analysis unavailable.")
+        st.info("Risk analysis isn’t ready yet.")
 
+# MIDDLE: AI checklist
 with col_mid:
-    st.subheader("Storm Prep Checklist -")
+    st.subheader("Storm Prep Checklist")
     if analysis.get("risk") == "ERROR":
-        st.info("Checklist is hidden because the ZIP is invalid/unknown.")
+        st.info("Checklist is hidden until we have a valid ZIP.")
     elif checklist:
         st.markdown("\n".join(f"- {it}" for it in checklist))
     else:
-        st.markdown(
-            "- Water (3 days)\n"
-            "- Non-perishable food\n"
-            "- Medications\n"
-            "- Flashlight & batteries\n"
-            "- First aid kit\n"
-            "- Important documents in a waterproof bag"
-        )
+        st.info("Generating your checklist…")
 
+# RIGHT: Map
 with col_map:
     if show_map:
-        st.subheader("Map - ")
+        st.subheader("Map")
         if analysis.get("risk") == "ERROR":
-            st.info("Map is hidden because the ZIP is invalid/unknown.")
+            st.info("Map is hidden until we have a valid ZIP.")
         else:
             layers = []
             if advisory and advisory.get("center") and advisory.get("radius_km"):
@@ -374,30 +345,32 @@ with col_map:
             ))
 
 left_span, _ = st.columns([2.0, 1.6], gap="large")
+
+# ROUTE: nearest open shelter with a one-click Google Maps link
 with left_span:
-    st.subheader("Route -")
+    st.subheader("Route")
     if analysis.get("risk") == "ERROR":
-        st.info("Route is not available because the ZIP is invalid/unknown.")
+        st.info("Route will appear once we have a valid ZIP.")
     elif plan:
         plan_dist_km = plan.get("distance_km")
         plan_dist_mi = plan.get("distance_mi") or (km_to_mi(plan_dist_km) if isinstance(plan_dist_km, (int, float)) else None)
         if isinstance(plan_dist_mi, (int, float)):
-            st.success(f"Nearest open shelter: {plan['name']} ({plan_dist_mi:.1f} mi, ETA {plan['eta_min']})")
+            st.success(f"Nearest open shelter: {plan['name']} ({plan_dist_mi:.1f} mi, ETA {plan['eta_min']} min)")
         else:
-            st.success(f"Nearest open shelter: {plan['name']} ({plan_dist_km:.1f} km, ETA {plan['eta_min']})")
+            st.success(f"Nearest open shelter: {plan['name']} ({plan_dist_km:.1f} km, ETA {plan['eta_min']} min)")
         params = {"api": 1, "destination": f"{plan['lat']},{plan['lon']}"}
         maps_url = "https://www.google.com/maps/dir/?" + urlencode(params)
         st.markdown(f"[Open route in Google Maps]({maps_url})")
     else:
-        st.info("No open shelters found.")
+        st.info("No open shelters found nearby.")
 
 st.markdown("")  # spacer
 
-# ========== AI Rumor Check (FORM-BASED, ATOMIC SUBMIT) ==========
+# ========== Rumor Check (LLM-powered) ==========
 if show_verifier:
-    st.subheader("Gemini Rumor Check -")
+    st.subheader("Rumor Check")
     if analysis.get("risk") == "ERROR":
-        st.info("Verifier is disabled because the ZIP is invalid/unknown.")
+        st.info("Verifier will appear once we have a valid ZIP.")
     else:
         APP_FORM_KEY     = f"{APP_NS}_llm_form"
         LLM_TEXT_KEY     = f"{APP_NS}_llm_text"
@@ -407,19 +380,19 @@ if show_verifier:
 
         llm_cache = st.session_state.setdefault("llm_rumor_cache", {})
 
-        # Clear requested last run? do it BEFORE rendering widget
+        # Clear the text area on demand
         if st.session_state.get(LLM_PENDING_CLR):
             st.session_state[LLM_TEXT_KEY] = ""
             st.session_state.pop(LLM_PENDING_CLR, None)
 
-        st.caption("Write a rumor and Google Gemini will fact-check it, labeling each as True, False, or Misleading with a brief note.")
+        st.caption("Paste one or more rumors (one per line). We’ll label each True, False, or Misleading with a short note.")
 
         with st.form(APP_FORM_KEY, clear_on_submit=False):
             llm_text = st.text_area(
-                "Enter Rumor(s):",
+                "Enter one rumor per line:",
                 value=st.session_state.get(LLM_TEXT_KEY, ""),
                 key=LLM_TEXT_KEY,
-                help="Example: Boil tap water after a flood’ (True); ‘Tape windows before a hurricane’ (Misleading);",
+                help="Example: 'Boil tap water after a flood' (True); 'Tape windows before a hurricane' (Misleading).",
             )
             colA, colB, _ = st.columns([1, 1, 7])
             with colA:
@@ -427,18 +400,18 @@ if show_verifier:
             with colB:
                 submit_clear = st.form_submit_button("Clear")
 
-        # Handle Clear
+        # Clear
         if submit_clear:
             st.session_state.pop(LLM_RESULT_KEY, None)
             st.session_state.pop(LLM_LAST_QUERY, None)
             st.session_state[LLM_PENDING_CLR] = True
             st.rerun()
 
-        # Normalize input
+        # Normalize request
         items = [line.strip() for line in (llm_text or "").splitlines() if line.strip()]
         key_joined = "\n".join(items)
 
-        # Handle Check
+        # Check
         if submit_check:
             if not items:
                 st.session_state.pop(LLM_RESULT_KEY, None)
@@ -455,9 +428,9 @@ if show_verifier:
         # Render result
         llm_live = st.session_state.get(LLM_RESULT_KEY)
         if not items and not llm_live:
-            st.info("Type something and click **Check with Google Gemini**.")
+            st.info("Type a rumor and click **Check with Gemini**.")
         elif not llm_live:
-            st.info("Click **Check with Google Gemini** to verify.")
+            st.info("Click **Check with Gemini** to verify.")
         else:
             VERDICT_LABELS = {
                 "TRUE": "True", "FALSE": "False", "MISLEADING": "Misleading",
@@ -471,16 +444,15 @@ if show_verifier:
             overall_raw = (llm_live.get("overall") or "CLEAR")
             overall = overall_raw.upper()
             matches = llm_live.get("matches", [])
-
             overall_display = VERDICT_LABELS.get(overall, overall_raw.title())
 
             if overall == "ERROR":
                 msg = (llm_live.get("error") or "")
                 umsg = msg.upper()
                 if any(k in umsg for k in ("API KEY NOT VALID", "API_KEY_INVALID")):
-                    st.error("API key invalid/restricted. Set GOOGLE_API_KEY for local dev.")
+                    st.error("API key looks invalid or restricted. Please update GOOGLE_API_KEY.")
                 elif any(k in umsg for k in ("UNAVAILABLE", "OVERLOADED", "503", "TIMEOUT")):
-                    st.warning("The model is busy. Please try again shortly.")
+                    st.warning("The model is busy. Try again in a moment.")
                 else:
                     st.error(msg or "LLM error.")
             elif (overall in ("CLEAR", "SAFE")) and not matches:
@@ -492,7 +464,7 @@ if show_verifier:
                     note = de_shout(m.get("note",""))
                     st.markdown(f"- **Rumor:** {m['pattern']} — {note}")
 
-# Collapsibles
+# Details drawer: handy for debugging and transparency
 with st.expander("Storm Details (.json)", expanded=False):
     if advisory:
         st.json(advisory)
@@ -509,6 +481,7 @@ def _fmt_ms(v):
     except Exception:
         return "—"
 
+# Lightweight run diagnostics so we can spot slow steps quickly
 with st.expander("Agent Status", expanded=False):
     status_lines = [
         f"Watcher: {_fmt_ms(timings.get('watcher_ms'))} ms" + (f" | ERROR: {errors['watcher']}" if 'watcher' in errors else ""),

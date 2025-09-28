@@ -10,12 +10,13 @@ __all__ = ["read_shelters", "SheltersError", "is_open"]
 
 
 class SheltersError(Exception):
-    """Raised when shelters.json is unreadable or invalid."""
+    """We couldn't read or parse shelters.json, or its shape wasn't usable."""
 
 
 def _read_text_utf8_sig(path: str) -> str:
     """
-    Read a file as text, tolerating UTF-8 BOM if present.
+    Read a text file and tolerate a UTF-8 BOM.
+    (Some editors add one; we don't want that to break parsing.)
     """
     with open(path, "rb") as f:
         return f.read().decode("utf-8-sig")
@@ -23,38 +24,39 @@ def _read_text_utf8_sig(path: str) -> str:
 
 def read_shelters(data_dir: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Read <data_dir>/shelters.json and return (shelters_list, debug_info).
+    Load <data_dir>/shelters.json and return:
+      (shelters_list, debug_info)
 
-    Accepts either:
-      - a top-level list: [ {...}, {...} ]
-      - or an object with "shelters": { "shelters": [ {...}, ... ] }
+    File shape we accept:
+      - A top-level list: [ {...}, {...} ]
+      - Or an object with a "shelters" list: { "shelters": [ {...}, ... ] }
 
-    Debug info includes file path, sha256, and mtime.
-    Raises SheltersError on any problem.
+    The debug dict includes:
+      - absolute path
+      - sha256 of the raw file text
+      - mtime (when available)
+
+    Raises SheltersError with a clear message if anything goes wrong.
     """
     path = os.path.abspath(os.path.join(data_dir, "shelters.json"))
 
-    # Read & parse JSON, tolerant of BOM
+    # Read & parse JSON (be forgiving about BOMs).
     try:
         text = _read_text_utf8_sig(path)
     except Exception as e:
-        raise SheltersError(f"Cannot read shelters file: {e}")
+        raise SheltersError(f"Cannot read shelters file at {path}: {e}")
 
     try:
         obj = json.loads(text)
     except Exception as e:
-        raise SheltersError(f"Invalid shelters JSON: {e}")
+        raise SheltersError(f"Invalid shelters JSON at {path}: {e}")
 
-    # Normalize to a list
-    if isinstance(obj, dict) and "shelters" in obj:
-        shelters = obj["shelters"]
-    else:
-        shelters = obj
-
+    # Normalize to a list.
+    shelters = obj.get("shelters") if isinstance(obj, dict) else obj
     if not isinstance(shelters, list):
-        raise SheltersError("Shelters JSON must be a list or an object with a 'shelters' list.")
+        raise SheltersError("Expected a list or an object with a 'shelters' list.")
 
-    # Prepare debug
+    # Build simple debug info the UI can show.
     dbg: Dict[str, Any] = {
         "shelters_path": path,
         "shelters_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -69,13 +71,13 @@ def read_shelters(data_dir: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
 
 def is_open(entry: Dict[str, Any]) -> bool:
     """
-    Determine whether a shelter entry is 'open'.
+    Decide if a shelter is open.
 
     Supported forms:
       - {"open": true/false}
-      - {"status": "open"|"closed"|...} (case-insensitive)
+      - {"status": "open" | "closed" | ...}  (case-insensitive)
 
-    Defaults to False if ambiguous or missing.
+    If it's unclear or missing, we treat it as closed.
     """
     if isinstance(entry.get("open"), bool):
         return entry["open"]

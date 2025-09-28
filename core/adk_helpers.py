@@ -3,17 +3,18 @@ from __future__ import annotations
 import threading
 from typing import Optional, Tuple, List, Any
 
-# ADK / GenAI
+# ADK / GenAI (assumed present for this project)
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.adk.events import Event
 from google.genai import types as genai_types
 
-# ---------- singletons ----------
+# One shared, thread-safe in-memory session service for the whole app.
 _SESSION_LOCK = threading.Lock()
 _SESSION: Optional[InMemorySessionService] = None
 
 def _get_session_service() -> InMemorySessionService:
+    """Return a singleton InMemorySessionService instance."""
     global _SESSION
     with _SESSION_LOCK:
         if _SESSION is None:
@@ -21,40 +22,36 @@ def _get_session_service() -> InMemorySessionService:
     return _SESSION
 
 def ensure_session(app_name: str, user_id: str, session_id: str) -> None:
+    """
+    Make sure a session exists for (app_name, user_id, session_id).
+    We rely on ADK's synchronous helpers and fail fast if they're missing.
+    """
     ss = _get_session_service()
-    # ADK's InMemorySessionService methods are async; use its sync helpers if present:
-    # Fallback: tiny compatibility wrapper
     try:
         sess = ss.get_session_sync(app_name=app_name, user_id=user_id, session_id=session_id)
-    except AttributeError:
-        # Provide sync behavior using internal store if necessary
-        try:
-            # available in newer versions
-            sess = ss.get_session(app_name=app_name, user_id=user_id, session_id=session_id)  # type: ignore
-        except Exception:
-            sess = None
+    except AttributeError as e:
+        raise RuntimeError("ADK requires get_session_sync; update ADK to a recent version.") from e
+
     if not sess:
         try:
             ss.create_session_sync(app_name=app_name, user_id=user_id, session_id=session_id)
-        except AttributeError:
-            # fallback to async (best-effort)
-            import asyncio
-            loop = asyncio.new_event_loop()
-            try:
-                loop.run_until_complete(ss.create_session(app_name=app_name, user_id=user_id, session_id=session_id))  # type: ignore
-            finally:
-                loop.close()
+        except AttributeError as e:
+            raise RuntimeError("ADK requires create_session_sync; update ADK to a recent version.") from e
 
 def run_llm_agent_text_debug(
-    agent,
+    agent: Any,
     prompt: str,
     app_name: str,
     user_id: str,
     session_id: str,
 ) -> Tuple[Optional[str], List[Event], Optional[str]]:
     """
-    Run a single LlmAgent with a text prompt. Returns (final_text, events, error).
-    The agent should have its .instruction set already.
+    Run a single LlmAgent with a user text prompt.
+
+    Returns:
+      final_text: model's top-level text (first part) or None if unavailable
+      events:     full event stream (useful for debugging/telemetry)
+      err:        error string if something went wrong, else None
     """
     ensure_session(app_name, user_id, session_id)
     ss = _get_session_service()
@@ -70,8 +67,11 @@ def run_llm_agent_text_debug(
             events.append(ev)
             if ev.is_final_response() and ev.content:
                 parts = ev.content.parts or []
-                if parts and getattr(parts[0], "text", None):
-                    final_text = parts[0].text
+                if parts:
+                    # Take the first text part; callers needing more can inspect events.
+                    text = getattr(parts[0], "text", None)
+                    if isinstance(text, str):
+                        final_text = text
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
 

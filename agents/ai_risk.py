@@ -7,41 +7,50 @@ from pydantic import BaseModel, Field
 from google.adk.agents.llm_agent import LlmAgent
 from google.genai import types
 
+
+# What we want back from the LLM (strict JSON)
 class RiskOutput(BaseModel):
-    risk: Literal["HIGH", "MEDIUM", "LOW"] = Field(description="Overall hurricane risk.")
-    why: str = Field(description="One sentence (<=25 words) plain text reason.")
+    risk: Literal["SAFE", "LOW", "MEDIUM", "HIGH"] = Field(
+        description="Overall hurricane risk."
+    )
+    why: str = Field(
+        description="One sentence (<=25 words) explanation in plain English."
+    )
+
 
 def build_risk_agent() -> LlmAgent:
     """
-    Classifies hurricane risk from facts and returns STRICT JSON via output_schema:
-      { "risk": "HIGH|MEDIUM|LOW", "why": "one sentence" }
+    Build a small, steady LLM agent that classifies hurricane risk
+    and returns STRICT JSON matching RiskOutput.
     """
-    instruction = """You are a hurricane risk classifier.
 
-You receive a Facts block (plain key=value lines). Decide a single overall risk:
-- HIGH, MEDIUM, or LOW.
-
-Guidance (not mandatory):
-- HIGH if inside advisory radius, or within ~50 km at Category 2+.
-- MEDIUM if within (radius + ~120 km) or inside at TS/CAT1.
-- LOW otherwise.
-
-OUTPUT FORMAT:
-Return ONLY a JSON object matching the provided schema.
-No markdown, no code fences, no emojis, no prefixes.
-"""
+    # This instruction is intentionally concise. Your watcher can still
+    # override `agent.instruction` at runtime to inject the specific facts.
+    instruction = (
+        "You are a hurricane risk classifier.\n\n"
+        "You will receive a Facts block with keys like:\n"
+        "  zip, distance_mi, radius_mi, category, inside_advisory (true/false).\n\n"
+        "Decide ONE overall risk: SAFE, LOW, MEDIUM, or HIGH.\n"
+        "Heuristics (guidance, not rules):\n"
+        "  - HIGH   if inside the advisory radius, OR within ~30 mi at Category ≥2.\n"
+        "  - MEDIUM if within (radius + ~75 mi), or within ~120 mi at TS/CAT1.\n"
+        "  - LOW    otherwise, when there's some activity but limited threat.\n"
+        "  - SAFE   when no active advisory nearby or clearly far away.\n\n"
+        "OUTPUT:\n"
+        "Return ONLY a JSON object that matches the provided schema — no prose, no markdown.\n"
+        'Example: {\"risk\":\"MEDIUM\",\"why\":\"Bands likely tomorrow; you are within the extended radius.\"}'
+    )
 
     return LlmAgent(
-        name="RiskClassifier",
+        name="HurricaneRiskClassifier",
         model="gemini-2.0-flash",
+        description="Classifies hurricane risk (SAFE/LOW/MEDIUM/HIGH) and explains why in one sentence.",
         include_contents="none",
         instruction=instruction,
-        output_schema=RiskOutput,  # Enforce strict JSON
-        # Silence transfer warnings by explicitly disallowing transfers
-        disallow_transfer_to_parent=True,
-        disallow_transfer_to_peers=True,
+        output_schema=RiskOutput,  # Enforce strict JSON shape
         generate_content_config=types.GenerateContentConfig(
-            temperature=0.2,
-            max_output_tokens=128,
+            temperature=0.2,          # keep outputs consistent
+            max_output_tokens=120,
         ),
+        # Note: we do NOT set transfer flags here to avoid ADK warnings with output_schema.
     )

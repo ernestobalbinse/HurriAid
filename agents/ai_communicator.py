@@ -1,57 +1,60 @@
 # agents/ai_communicator.py
 from __future__ import annotations
-import json
+
+import json  # (kept in case callers want to log/inspect raw text)
 from typing import List, Dict, Any
 
-# Soft dependency so the UI can still run without ADK
+from pydantic import BaseModel, Field
+from core.parallel_exec import ADKNotAvailable
+
+# We require Google ADK + Gemini for this project. If imports fail, we stop.
 try:
     from google.adk.agents.llm_agent import LlmAgent
     from google.genai import types
-    _ADK_OK = True
-except Exception:
-    _ADK_OK = False
+except Exception as e:
+    raise ADKNotAvailable(f"Google ADK is required to build AI communicator: {e}")
 
-from pydantic import BaseModel, Field
 
-# ---- Output schema to force JSON shape ----
+# ---- Output schema: the model must return exactly this shape ----
 class ChecklistOut(BaseModel):
-    items: List[str] = Field(description="Checklist items, ordered and concise")
+    items: List[str] = Field(description="Concise, deduplicated checklist items in priority order")
+
 
 def build_checklist_llm_agent() -> "LlmAgent":
     """
-    Builds a low-temperature LlmAgent that outputs STRICT JSON:
-      {"items": ["...", "...", ...]}
-    Bilingual (EN/ES) and risk-aware.
+    Build a Gemini agent that creates a SHORT, risk-aware hurricane checklist.
+    - Always AI-driven (no rule-based backup).
+    - Output must be STRICT JSON matching ChecklistOut.
+    - We keep the instruction template generic so callers can .format(zip=..., risk=...).
     """
-    if not _ADK_OK:
-        raise RuntimeError("ADK not available for LlmAgent")
-
     return LlmAgent(
         model="gemini-2.0-flash",
         name="checklist_agent",
-        description="Generates a hurricane-readiness checklist tailored to risk (EN/ES).",
+        description="Generates a short, risk-aware hurricane readiness checklist.",
         include_contents="none",
         generate_content_config=types.GenerateContentConfig(
-            temperature=0.2,            # keep it steady for demos
-            max_output_tokens=400
+            # A touch of creativity so the items don’t feel robotic, still reliable.
+            temperature=0.4,
+            max_output_tokens=400,
         ),
         instruction=(
-            "You are a hurricane readiness assistant. Given a U.S. ZIP and a risk level, "
-            "produce a concise, actionable 24–48h checklist.\n\n"
-            "RULES:\n"
-            "- Output ONLY raw JSON exactly like: {\"items\": [\"...\", \"...\", ...]}\n"
-            "- 8–14 items total.\n"
-            "- Always include: Water (3 days), Non-perishable food, Medications, "
-            "Flashlight & batteries, First aid kit, Important documents in waterproof bag, "
-            "Charge power banks, Refuel vehicle > 1/2 tank.\n"
-            "- If risk is MEDIUM, ALSO add: Check evacuation routes, Secure windows/doors, Pack go-bag.\n"
-            "- If risk is HIGH, ALSO add: Plan to evacuate if officials advise, Move to higher ground if flooding risk, Keep radio/alerts on.\n"
-            "\"Water (3 days) / Agua (3 días)\".\n"
-            "- No markdown, no prose, no explanations—JSON only.\n\n"
-            "INPUTS:\n"
-            "ZIP: {zip}\n"
-            "RISK: {risk}\n"
+            "You are a hurricane readiness assistant. Create a SHORT, risk-aware checklist "
+            "for the next 12–24 hours.\n\n"
+            "INPUTS\n"
+            f"- zip: {{zip}}\n"
+            f"- risk: {{risk}}  (SAFE | LOW | MEDIUM | HIGH)\n\n"
+            "OUTPUT\n"
+            "Return STRICT JSON only:\n"
+            "{\"items\": [\"item 1\", \"item 2\", \"...\"]}\n\n"
+            "SIZE by risk (cap the list accordingly):\n"
+            "- SAFE  : 0–2 items (light reminders only)\n"
+            "- LOW   : 3–4 items (quick, low-effort tasks; avoid multi-day stockpiles)\n"
+            "- MEDIUM: 5–7 items (add core supplies: water, food, meds, radio, cash)\n"
+            "- HIGH  : 8–12 items (full readiness: 3-day supplies, first aid, docs, evac plan, fuel)\n\n"
+            "GUIDANCE\n"
+            "- Items must be specific, practical, and deduplicated.\n"
+            "- No prose, no explanations, no emojis, no markdown—JSON only.\n"
+            "- Keep phrasing tight (bullet-style).\n"
         ),
-        output_schema=ChecklistOut,   # validates shape
-        # Note: we don't rely on output_key for retrieval; we parse the final text event
+        output_schema=ChecklistOut,  # Enforces the exact JSON shape we expect
     )

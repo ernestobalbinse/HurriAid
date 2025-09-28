@@ -1,7 +1,7 @@
 {
   "active": true,
   "issued_at": "2025-09-28T04:20:00Z",
-  "category": "CAT3",
+  "category": "CAT5",
   "radius_km": 100,
   "center": { "lat": 25.774, "lon": -80.19 }
 }

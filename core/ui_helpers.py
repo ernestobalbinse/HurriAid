@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Tuple
 
-# Simple badge helper (HTML string). Use with unsafe_allow_html=True in st.markdown.
+# Color palette for the little "chips" in the UI.
 BADGE_COLORS = {
     "green": "#16a34a",
     "amber": "#d97706",
@@ -12,30 +12,45 @@ BADGE_COLORS = {
 }
 
 def badge(label: str, color: str = "gray") -> str:
-    c = BADGE_COLORS.get(color, BADGE_COLORS["gray"])
+    """
+    Build a compact, colored pill as an HTML string.
+    Use with Streamlit like:
+      st.markdown(badge("RISK: HIGH", "red"), unsafe_allow_html=True)
+    """
+    bg = BADGE_COLORS.get(color, BADGE_COLORS["gray"])
     return (
-        "<span style='display:inline-block;padding:2px 8px;border-radius:999px;"
-        "font-size:12px;font-weight:600;background:{bg};color:white'>{label}</span>"
-    ).format(bg=c, label=label)
+        f"<span style='display:inline-block;padding:2px 8px;border-radius:999px;"
+        f"font-size:12px;font-weight:600;background:{bg};color:white'>{label}</span>"
+    )
 
 def compute_freshness(issued_at_iso: str) -> Tuple[str, str]:
     """
-    Returns (status, detail) where status ∈ {"FRESH","STALE","UNKNOWN"}.
-    - FRESH: ≤ 30 minutes old
-    - STALE: 31–180 minutes old or older (shows hours)
-    - UNKNOWN: missing/unparseable timestamp
+    Convert an ISO timestamp to a quick freshness label for the UI.
+
+    Returns (status, detail):
+      - FRESH   : 0–30 min old
+      - STALE   : 31–180 min old (min), then hours once >180 min
+      - UNKNOWN : missing or unparseable timestamp
+
+    Notes:
+      - We treat 'Z' as UTC.
+      - Negative ages (clock skew) clamp to zero—no scary negatives.
     """
     if not issued_at_iso:
         return "UNKNOWN", "No timestamp"
+
     try:
+        # Accept both '...Z' and '+00:00' forms.
         t = datetime.fromisoformat(issued_at_iso.replace("Z", "+00:00"))
         now = datetime.now(timezone.utc)
+
+        # Clamp to avoid negative when clocks drift.
         age_min = max(0, int((now - t).total_seconds() // 60))
+
         if age_min <= 30:
             return "FRESH", f"{age_min} min old"
-        elif age_min <= 180:
+        if age_min <= 180:
             return "STALE", f"{age_min} min old"
-        else:
-            return "STALE", f"{age_min // 60} h old"
+        return "STALE", f"{age_min // 60} h old"
     except Exception:
         return "UNKNOWN", "Unparseable timestamp"
