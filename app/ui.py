@@ -2,6 +2,9 @@
 import sys, os, hashlib
 from datetime import datetime
 from urllib.parse import urlencode
+# add near the top with imports
+import json
+
 
 # ---- Third-party ----
 import streamlit as st
@@ -273,10 +276,28 @@ with col_left:
                 bullets.append(f"- **Advisory area:** {where} (radius ≈ {float(radius_km):.1f} km)")
             st.markdown("\n".join(bullets))
 
-            # AI explainer (validated upstream)
+            # AI-only explainer with robust fallback to the model's raw JSON
+            # AI explainer (prefer explicit field, then debug->risk_obj.why)
             why = result.get("analysis_explainer") or result.get("risk_explainer")
+            if not (isinstance(why, str) and why.strip()):
+                dbg = result.get("debug") or {}
+                robj = dbg.get("risk_obj") or {}
+                if isinstance(robj, dict):
+                    w2 = robj.get("why")
+                    if isinstance(w2, str) and w2.strip():
+                        why = w2
+
+                if isinstance(robj, dict):
+                    candidate = str(robj.get("why", "")).strip()
+                    if candidate:
+                        why = candidate
+
             if isinstance(why, str) and why.strip():
-                st.markdown(f"**Why:** {why}")
+                st.markdown(f"**Why (AI):** {why}")
+            else:
+                st.caption("AI explanation unavailable.")
+
+
     else:
         st.info("Risk analysis unavailable.")
 
@@ -548,3 +569,9 @@ with st.expander("Advisory (details)", expanded=False):
             st.code(dbg["explainer_prompt"], language="text")
     else:
         st.caption("No advisory data.")
+
+dbg = result.get("debug") or {}
+raw_ai = dbg.get("risk_raw")
+if raw_ai:
+    st.caption("AI raw (risk_raw):")
+    st.code(str(raw_ai), language="json")
