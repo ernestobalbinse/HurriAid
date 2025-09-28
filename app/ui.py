@@ -230,6 +230,31 @@ with col_left:
                 where = "Inside" if dist_km <= float(radius_km) else "Outside"
                 bullets.append(f"- **Advisory area:** {where} (radius ≈ {float(radius_km):.1f} km)")
             st.markdown("\n".join(bullets))
+
+
+    # DEBUG — remove after inspection
+    st.code(f"raw_explainer = {repr((result.get('debug') or {}).get('risk_explainer_raw'))}", language="text")
+
+    dbg = result.get("debug") or {}
+    st.code("explainer_debug = " + repr({
+        "ai": result.get("flags", {}).get("risk_explainer_ai"),
+        "error": dbg.get("risk_explainer_error"),
+        "events": dbg.get("risk_explainer_events"),
+        "raw": dbg.get("risk_explainer_raw"),
+    }), language="text")
+
+    # DEBUG
+    dbg = result.get("debug") or {}
+    st.code("watcher_impl = " + repr(dbg.get("watcher_impl")), language="text")
+
+    # --- AI explainer (one sentence) ---
+    expl = result.get("analysis_explainer")
+    if isinstance(expl, str) and expl.strip():
+        st.caption(f"Why: {expl}")
+    
+    
+
+
     else:
         st.info("Risk analysis unavailable.")
 
@@ -446,6 +471,9 @@ with st.expander("Agent Status", expanded=False):
         f"Parallel: {_fmt_ms(timings.get('parallel_ms'))} ms",
         f"Total:    {_fmt_ms(timings.get('total_ms'))} ms (ran at {st.session_state.get('last_run', '—')})",
     ]
+    origin = "AI" if (result.get('flags', {}).get('risk_explainer_ai')) else "fallback"
+    status_lines.insert(3, f"Explainer: {_fmt_ms(timings.get('explainer_ms'))} ms | {origin}")
+
     st.code("\n".join(status_lines), language="text")
 
 # --- History (collapsible) ---

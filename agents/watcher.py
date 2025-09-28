@@ -1,7 +1,5 @@
 # agents/watcher.py
 from __future__ import annotations
-from pydantic import PrivateAttr
-
 
 import json
 import os
@@ -9,36 +7,26 @@ import math
 import time
 from typing import Dict, Any, Tuple, Optional
 
-# --- local minimal context (shim) ---
-class _MiniActions:
-    def __init__(self):
-        self.escalate = False  # LoopAgent-style stop flag
+# ---- LLM explainer (soft dep; app still works with fallback) ----
+from agents.ai_explainer import build_risk_explainer_agent
 
-class _MiniContext:
-    def __init__(self):
-        self.session_state = {}
-        self.actions = _MiniActions()
-
-
-# --- ADK presence (UI shows a friendly error if missing) ---
-try:
-    from google.adk.agents import LoopAgent, BaseAgent
-    from google.adk.agents.invocation_context import InvocationContext
-except Exception as e:
-    from core.parallel_exec import ADKNotAvailable
-    raise ADKNotAvailable(f"Google ADK not available: {e}")
-
-# --- Try to import pgeocode ---
+# ---- pgeocode for ZIP -> lat/lon ----
 try:
     import pgeocode  # pip install pgeocode
     _PGEOCODE_AVAILABLE = True
 except Exception:
     _PGEOCODE_AVAILABLE = False
 
-# Optional helper: if your repo already wraps pgeocode.
+# ---------- Helpers ----------
+
+def _load_json(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
 def _resolve_zip_from_helper(zip_code: str) -> Optional[Tuple[float, float]]:
+    """Use project helper if present."""
     try:
-        from tools.zip_resolver import resolve_zip_latlon  # your helper (if present)
+        from tools.zip_resolver import resolve_zip_latlon  # optional helper
         lat, lon = resolve_zip_latlon(zip_code)
         if lat is None or lon is None:
             return None
@@ -46,7 +34,6 @@ def _resolve_zip_from_helper(zip_code: str) -> Optional[Tuple[float, float]]:
     except Exception:
         return None
 
-# Cache a single pgeocode Nominatim instance (US)
 _geocoder = None
 def _get_geocoder():
     global _geocoder
@@ -55,18 +42,11 @@ def _get_geocoder():
     return _geocoder
 
 def _resolve_zip_latlon(zip_code: str) -> Optional[Tuple[float, float]]:
-    """
-    Resolve ZIP -> (lat, lon) using:
-      1) tools.zip_resolver.resolve_zip_latlon if available,
-      2) pgeocode.Nominatim('us') otherwise.
-    Returns None if unknown or dependency missing.
-    """
-    # 1) Prefer project helper if present
+    # 1) project helper
     coords = _resolve_zip_from_helper(zip_code)
     if coords is not None:
         return coords
-
-    # 2) Use pgeocode directly
+    # 2) pgeocode
     if not _PGEOCODE_AVAILABLE:
         return None
     try:
@@ -79,7 +59,6 @@ def _resolve_zip_latlon(zip_code: str) -> Optional[Tuple[float, float]]:
     except Exception:
         return None
 
-# --------- math & risk helpers ---------
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
@@ -87,10 +66,6 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dlmb = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb / 2) ** 2
     return 2 * R * math.asin(math.sqrt(a))
-
-def _load_json(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
 
 def _cat_rank(cat: str) -> int:
     if not cat:
@@ -128,127 +103,162 @@ def _fmt_watch_text(zip_code: str, risk: str, dist_km: float, inside: bool, radi
         f"Advisory area: {where} (radius ≈ {float(radius_km):.1f} km)"
     )
 
-# --------- ADK sub-agents ---------
-class AdvisoryReader(BaseAgent):
-    _data_dir: str = PrivateAttr()
+# ---------- Functional "steps" (Streamlit-safe, no ADK InvocationContext) ----------
 
-    def __init__(self, data_dir: str):
-        super().__init__(name="AdvisoryReader")
-        self._data_dir = data_dir
+def _step_read_advisory(state: Dict[str, Any], data_dir: str, timings: Dict[str, float]) -> None:
+    t0 = time.perf_counter()
+    path = os.path.join(data_dir, "sample_advisory.json")
+    try:
+        adv = _load_json(path)
+    except Exception:
+        adv = {}
 
-    async def run_async(self, context: InvocationContext) -> None:
-        t0 = time.perf_counter()
-        advisory_path = os.path.join(self._data_dir, "sample_advisory.json")  # <-- use _data_dir
-        try:
-            adv = _load_json(advisory_path)
-        except Exception:
-            adv = {}
+    center = (adv.get("center") or {})
+    adv_norm = {
+        "center": {
+            "lat": float(center.get("lat", 25.77)),
+            "lon": float(center.get("lon", -80.19)),
+        },
+        "radius_km": float(adv.get("radius_km", 100.0)),
+        "category": adv.get("category", "TS"),
+        "issued_at": adv.get("issued_at", ""),
+        "active": bool(adv.get("active", True)),
+    }
+    state["advisory"] = adv_norm
+    state["active"] = adv_norm["active"]
+    timings["watcher_ms_read"] = (time.perf_counter() - t0) * 1000.0
 
-        center = (adv.get("center") or {})
-        adv_norm = {
-            "center": {"lat": float(center.get("lat", 25.77)), "lon": float(center.get("lon", -80.19))},
-            "radius_km": float(adv.get("radius_km", 100.0)),
-            "category": adv.get("category", "TS"),
-            "issued_at": adv.get("issued_at", ""),
-            "active": bool(adv.get("active", True)),
-        }
+def _step_analyze_risk(state: Dict[str, Any], zip_code: str, timings: Dict[str, float]) -> None:
+    t0 = time.perf_counter()
+    adv = state.get("advisory") or {}
 
-        context.session_state["advisory"] = adv_norm
-        context.session_state["active"] = adv_norm["active"]
-        context.session_state.setdefault("timings_ms", {})
-        context.session_state["timings_ms"]["watcher_ms_read"] = (time.perf_counter() - t0) * 1000.0
+    if not adv:
+        state["analysis"] = {"risk": "ERROR", "reason": "No advisory data"}
+        timings["watcher_ms_analyze"] = (time.perf_counter() - t0) * 1000.0
+        return
 
-class RiskAnalyzer(BaseAgent):
-    _data_dir: str = PrivateAttr()
-    _zip_code: str = PrivateAttr()
+    coords = _resolve_zip_latlon(zip_code)
+    if coords is None:
+        reason = "pgeocode not installed" if not _PGEOCODE_AVAILABLE else f"Unknown ZIP {zip_code}"
+        state["analysis"] = {"risk": "ERROR", "reason": reason}
+        timings["watcher_ms_analyze"] = (time.perf_counter() - t0) * 1000.0
+        return
 
-    def __init__(self, data_dir: str, zip_code: str):
-        super().__init__(name="RiskAnalyzer")
-        self._data_dir = data_dir
-        self._zip_code = zip_code
+    zlat, zlon = coords
+    clat, clon = float(adv["center"]["lat"]), float(adv["center"]["lon"])
+    dist_km = _haversine_km(zlat, zlon, clat, clon)
+    radius_km = float(adv["radius_km"])
+    inside = dist_km <= radius_km
+    risk = _risk_heuristic(dist_km, radius_km, str(adv.get("category", "")))
 
-    async def run_async(self, context: InvocationContext) -> None:
-        t0 = time.perf_counter()
-        state = context.session_state
-        adv = state.get("advisory") or {}
+    state["zip_point"] = {"lat": zlat, "lon": zlon}
+    state["analysis"] = {"risk": risk, "distance_km": round(dist_km, 1)}
+    state["watcher_text"] = _fmt_watch_text(zip_code, risk, dist_km, inside, radius_km)
+    timings["watcher_ms_analyze"] = (time.perf_counter() - t0) * 1000.0
 
-        # Resolve ZIP via pgeocode/helper
-        coords = _resolve_zip_latlon(self._zip_code)  # <-- use _zip_code
-        if coords is None:
-            reason = "pgeocode not installed" if not _PGEOCODE_AVAILABLE else f"Unknown ZIP {self._zip_code}"
-            state["analysis"] = {"risk": "ERROR", "reason": reason}
-            return
+def _step_explain_risk(state: Dict[str, Any], zip_code: str, timings: Dict[str, float]) -> None:
+    """Call LLM explainer; fall back deterministically; store debug."""
+    t0 = time.perf_counter()
+    adv = state.get("advisory") or {}
+    analysis = state.get("analysis") or {}
 
-        zlat, zlon = coords
-        clat, clon = float(adv["center"]["lat"]), float(adv["center"]["lon"])
-        dist_km = _haversine_km(zlat, zlon, clat, clon)
-        radius_km = float(adv["radius_km"])
-        inside = dist_km <= radius_km
-        risk = _risk_heuristic(dist_km, radius_km, str(adv.get("category", "")))
+    if not adv or not analysis or analysis.get("risk") in (None, "ERROR"):
+        return
+    if not bool(state.get("active", True)):
+        return
 
-        state["zip_point"] = {"lat": zlat, "lon": zlon}
-        state["analysis"] = {"risk": risk, "distance_km": round(dist_km, 1)}
-        state["watcher_text"] = _fmt_watch_text(self._zip_code, risk, dist_km, inside, radius_km)
+    risk = str(analysis.get("risk", ""))
+    dist_km = analysis.get("distance_km", "")
+    radius_km = (adv or {}).get("radius_km", "")
+    category = (adv or {}).get("category", "")
 
-        state.setdefault("timings_ms", {})
-        state["timings_ms"]["watcher_ms_analyze"] = (time.perf_counter() - t0) * 1000.0
-
-class StopIfInactive(BaseAgent):
-    def __init__(self):
-        super().__init__(name="StopIfInactive")
-
-    async def run_async(self, context: InvocationContext) -> None:
-        if not bool(context.session_state.get("active", True)):
-            context.actions.escalate = True
-
-# --------- Builder + one-shot runner ---------
-def build_watcher_loop_agent(data_dir: str, zip_code: str) -> LoopAgent:
-    return LoopAgent(
-        name="WatcherLoop",
-        sub_agents=[
-            AdvisoryReader(data_dir),
-            RiskAnalyzer(data_dir, zip_code),
-            StopIfInactive(),
-        ],
-        # Default to single iteration per UI click (non-blocking).
-        # If you truly want continuous looping inside the same call, increase this —
-        # but Streamlit will be blocked until it finishes.
-        max_iterations=1,
-        description="Reads advisory, computes ZIP risk via pgeocode, stops if inactive."
+    prompt = (
+        f"ZIP: {zip_code}\n"
+        f"RISK: {risk}\n"
+        f"DIST_KM: {dist_km}\n"
+        f"RADIUS_KM: {radius_km}\n"
+        f"CATEGORY: {category}\n"
+        "Return ONE sentence (<=25 words) and start it with '🧠 AI: '."
     )
+
+    raw_text: Optional[str] = None
+    text: Optional[str] = None
+    used_ai = False
+    ev_summ = []
+    err_str = None
+
+    try:
+        # Build agent + run with debug to capture events/errors
+        agent = build_risk_explainer_agent()
+        from core.adk_helpers import run_llm_agent_text_debug
+        raw_text, ev_summ, err_str = run_llm_agent_text_debug(
+            agent, prompt, session_id=f"risk_expl_{zip_code}_{risk}"
+        )
+
+        # If the runner produced nothing and no explicit error, surface it
+        if err_str is None and not ev_summ and not raw_text:
+            err_str = "NO_EVENTS"
+
+        # Accept any non-empty model text as AI; normalize prefix
+        if isinstance(raw_text, str) and raw_text.strip():
+            text = raw_text.strip()
+            if not text.startswith("🧠 AI:"):
+                text = "🧠 AI: " + text
+            used_ai = True
+    except Exception as e:
+        err_str = f"{type(e).__name__}: {e}"
+        raw_text = None
+        text = None
+        used_ai = False
+
+
+    if not used_ai:
+        # Deterministic fallback (no 🧠 prefix)
+        inside = (
+            isinstance(dist_km, (int, float))
+            and isinstance(radius_km, (int, float))
+            and float(dist_km) <= float(radius_km)
+        )
+        where = "inside" if inside else "outside"
+        text = f"Risk is {risk} because ZIP {zip_code} is {where} the advisory radius and {dist_km} km from the storm center."
+
+    # Outputs + debug
+    state["risk_explainer"] = text
+    state.setdefault("flags", {})["risk_explainer_ai"] = used_ai
+
+    dbg = state.setdefault("debug", {})
+    dbg["watcher_impl"] = "shim-functional-v1"   # <- so you can confirm this file is active
+    dbg["risk_explainer_raw"] = raw_text
+    dbg["risk_explainer_prompt"] = prompt
+    dbg["risk_explainer_events"] = ev_summ
+    if err_str:
+        dbg["risk_explainer_error"] = err_str
+
+    timings["explainer_ms"] = (time.perf_counter() - t0) * 1000.0
+
+# ---------- Public API used by Coordinator/UI ----------
 
 def run_watcher_once(data_dir: str, zip_code: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    Streamlit-friendly one-iteration run.
-    Executes the three ADK sub-agents sequentially with a minimal context.
-    Produces the same session_state as the LoopAgent would after one pass.
+    Streamlit-friendly, deterministic single pass:
+      - read advisory
+      - compute risk
+      - generate AI explainer (or fallback)
+    Returns (state, timings).
     """
     t0 = time.perf_counter()
-    ctx = _MiniContext()
+    state: Dict[str, Any] = {}
+    timings: Dict[str, float] = {}
 
-    async def _one_iter():
-        reader = AdvisoryReader(data_dir)
-        analyzer = RiskAnalyzer(data_dir, zip_code)
-        stopper = StopIfInactive()
+    _step_read_advisory(state, data_dir, timings)
+    _step_analyze_risk(state, zip_code, timings)
+    _step_explain_risk(state, zip_code, timings)
 
-        await reader.run_async(ctx)
-        await analyzer.run_async(ctx)
-        await stopper.run_async(ctx)
-
-    import asyncio
-    try:
-        asyncio.run(_one_iter())
-    except RuntimeError:
-        # If we're (rarely) already inside a running loop, create a dedicated loop
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(_one_iter())
-        finally:
-            loop.close()
-
-    state = ctx.session_state
-    timings = state.get("timings_ms", {})
+    # Aggregate timings
     timings["watcher_ms"] = timings.get("watcher_ms_read", 0.0) + timings.get("watcher_ms_analyze", 0.0)
     timings["watcher_ms_total"] = (time.perf_counter() - t0) * 1000.0
     state["timings_ms"] = timings
+
+    # Safety net so UI never sees an empty analysis
+    state.setdefault("analysis", {"risk": "ERROR", "reason": "Watcher produced no analysis"})
     return state, timings
