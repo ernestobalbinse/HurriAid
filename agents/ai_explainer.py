@@ -8,7 +8,12 @@ try:
 except Exception:
     _ADK_OK = False
 
+
 def build_risk_explainer_agent():
+    """
+    Build a tiny LLM agent that emits a single-sentence explanation.
+    If ADK isn't available, callers should catch and fall back.
+    """
     if not _ADK_OK:
         raise RuntimeError("ADK not available")
 
@@ -22,11 +27,9 @@ def build_risk_explainer_agent():
             max_output_tokens=60
         ),
         instruction=(
-            "You are a hurricane risk explainer. The user prompt will contain ZIP, risk, "
-            "distance to storm center in km, advisory radius in km, and storm category.\n\n"
-            "Write ONE short sentence (<= 25 words) explaining *why* that risk level applies.\n"
-            "REQUIREMENTS:\n"
-            "• **Prefix** your sentence with the exact token: '🧠 AI: '\n"
-            "• Plain text only. No markdown, no lists, no extra text.\n"
+            "You are a hurricane risk explainer. The user prompt will include ZIP, risk, "
+            "distance to storm center (km), advisory radius (km), and category.\n\n"
+            "Write ONE short sentence (<= 25 words) explaining why that risk applies.\n"
+            "Start the sentence with '🧠 AI: '. Plain text only."
         ),
     )

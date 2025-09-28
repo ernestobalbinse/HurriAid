@@ -7,9 +7,6 @@ import math
 import time
 from typing import Dict, Any, Tuple, Optional
 
-# ---- LLM explainer (soft dep; app still works with fallback) ----
-from agents.ai_explainer import build_risk_explainer_agent
-
 # ---- pgeocode for ZIP -> lat/lon ----
 try:
     import pgeocode  # pip install pgeocode
@@ -103,7 +100,69 @@ def _fmt_watch_text(zip_code: str, risk: str, dist_km: float, inside: bool, radi
         f"Advisory area: {where} (radius ≈ {float(radius_km):.1f} km)"
     )
 
-# ---------- Functional "steps" (Streamlit-safe, no ADK InvocationContext) ----------
+# --- extract text helper for different Google clients ---
+def _extract_text_from_genai_response(resp):
+    try:
+        if getattr(resp, "text", None):
+            return resp.text
+    except Exception:
+        pass
+    try:
+        return resp.candidates[0].content.parts[0].text
+    except Exception:
+        return None
+
+# --- AI explainer backend: ADK -> google-genai (new) -> google-generativeai (old) ---
+def _call_risk_explainer_ai(prompt: str):
+    """
+    Returns: (text, events, err, backend)
+    backend ∈ {'ADK','GENAI:new','GENAI:old','NONE'}
+    """
+    # 1) ADK
+    try:
+        from agents.ai_explainer import build_risk_explainer_agent
+        from core.adk_helpers import run_llm_agent_text_debug
+        agent = build_risk_explainer_agent()
+        text, events, err = run_llm_agent_text_debug(
+            agent, prompt, app_name="hurri_aid", user_id="ui_user", session_id="sess_explainer"
+        )
+        if isinstance(text, str) and text.strip():
+            return text.strip(), events, err, "ADK"
+        if err is None and not events:
+            err = "NO_EVENTS"
+    except Exception as e:
+        text, events, err = None, [], f"ADK_ERROR {type(e).__name__}: {e}"
+
+    # 2) google-genai (new client)
+    genai_new_err = None
+    try:
+        from google import genai as genai_new  # pip install google-genai
+        client = genai_new.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+        model = os.environ.get("HURRIAID_EXPLAINER_MODEL", "gemini-2.0-flash")
+        # param name is 'contents'
+        resp = client.models.generate_content(model=model, contents=prompt)
+        raw = _extract_text_from_genai_response(resp)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip(), [], None, "GENAI:new"
+        return None, [], "GENAI_EMPTY", "GENAI:new"
+    except Exception as e:
+        genai_new_err = f"{type(e).__name__}: {e}"
+
+    # 3) google-generativeai (classic)
+    try:
+        import google.generativeai as genai_old  # pip install google-generativeai
+        genai_old.configure(api_key=os.environ.get("GOOGLE_API_KEY"))
+        model = os.environ.get("HURRIAID_EXPLAINER_MODEL", "gemini-2.0-flash")
+        m = genai_old.GenerativeModel(model)
+        resp = m.generate_content(prompt)
+        raw = _extract_text_from_genai_response(resp)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip(), [], None, "GENAI:old"
+        return None, [], "GENAI_OLD_EMPTY", "GENAI:old"
+    except Exception as e2:
+        return None, [], f"GENAI_BOTH_FAILED (new={genai_new_err}) (old={type(e2).__name__}: {e2})", "NONE"
+
+# ---------- Functional "steps" (Streamlit-safe, no InvocationContext) ----------
 
 def _step_read_advisory(state: Dict[str, Any], data_dir: str, timings: Dict[str, float]) -> None:
     t0 = time.perf_counter()
@@ -181,36 +240,15 @@ def _step_explain_risk(state: Dict[str, Any], zip_code: str, timings: Dict[str, 
         "Return ONE sentence (<=25 words) and start it with '🧠 AI: '."
     )
 
-    raw_text: Optional[str] = None
-    text: Optional[str] = None
+    raw_text, ev_summ, err_str, backend = _call_risk_explainer_ai(prompt)
+
     used_ai = False
-    ev_summ = []
-    err_str = None
-
-    try:
-        # Build agent + run with debug to capture events/errors
-        agent = build_risk_explainer_agent()
-        from core.adk_helpers import run_llm_agent_text_debug
-        raw_text, ev_summ, err_str = run_llm_agent_text_debug(
-            agent, prompt, session_id=f"risk_expl_{zip_code}_{risk}"
-        )
-
-        # If the runner produced nothing and no explicit error, surface it
-        if err_str is None and not ev_summ and not raw_text:
-            err_str = "NO_EVENTS"
-
-        # Accept any non-empty model text as AI; normalize prefix
-        if isinstance(raw_text, str) and raw_text.strip():
-            text = raw_text.strip()
-            if not text.startswith("🧠 AI:"):
-                text = "🧠 AI: " + text
-            used_ai = True
-    except Exception as e:
-        err_str = f"{type(e).__name__}: {e}"
-        raw_text = None
-        text = None
-        used_ai = False
-
+    text: Optional[str] = None
+    if isinstance(raw_text, str) and raw_text.strip():
+        text = raw_text.strip()
+        if not text.startswith("🧠 AI:"):
+            text = "🧠 AI: " + text
+        used_ai = True
 
     if not used_ai:
         # Deterministic fallback (no 🧠 prefix)
@@ -227,10 +265,11 @@ def _step_explain_risk(state: Dict[str, Any], zip_code: str, timings: Dict[str, 
     state.setdefault("flags", {})["risk_explainer_ai"] = used_ai
 
     dbg = state.setdefault("debug", {})
-    dbg["watcher_impl"] = "shim-functional-v1"   # <- so you can confirm this file is active
+    dbg["watcher_impl"] = "shim-functional-v1"
     dbg["risk_explainer_raw"] = raw_text
     dbg["risk_explainer_prompt"] = prompt
     dbg["risk_explainer_events"] = ev_summ
+    dbg["risk_explainer_backend"] = backend  # 'ADK' | 'GENAI:new' | 'GENAI:old' | 'NONE'
     if err_str:
         dbg["risk_explainer_error"] = err_str
 

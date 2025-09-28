@@ -31,7 +31,7 @@ def run_llm_agent_text_debug(agent, prompt: str,
                              session_id: str = "sess_text_dbg") -> Tuple[Optional[str], List[str], Optional[str]]:
     """
     Debug-friendly: returns (final_text, event_summaries, error_str).
-    Summaries contain shape like: "final=True content=True preview='...'"
+    Summaries look like: "final=True content=True preview='...'"
     """
     if not _ADK_OK:
         return None, [], "ADK_NOT_AVAILABLE"
@@ -50,7 +50,6 @@ def run_llm_agent_text_debug(agent, prompt: str,
 
         for ev in events:
             saw_any = True
-            # Defensive checks (ADK interfaces can vary)
             try:
                 is_final = bool(ev.is_final_response())
             except Exception:
@@ -75,7 +74,6 @@ def run_llm_agent_text_debug(agent, prompt: str,
             summaries.append(f"final={is_final} content={has_content} preview='{preview}'")
 
         if not saw_any and final_text is None:
-            # No exceptions, but also no events produced
             return None, summaries, "NO_EVENTS"
 
         return final_text, summaries, None

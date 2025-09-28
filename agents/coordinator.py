@@ -41,8 +41,13 @@ class Coordinator:
         zip_point = state.get("zip_point")
         watcher_text = state.get("watcher_text", "")
         active = bool(state.get("active", True))
+        # ... after state = run_watcher_once(...)
         debug = state.get("debug") or {}
         flags = state.get("flags") or {}
+        result["analysis_explainer"] = state.get("risk_explainer")
+        if debug: result["debug"] = debug
+        if flags: result.setdefault("flags", {}).update(flags)
+
 
         # Inactive -> SAFE + note
         if not active:
@@ -86,10 +91,13 @@ class Coordinator:
         result["advisory"] = advisory
         result["analysis"] = analysis
         result["zip_point"] = zip_point
-        result["plan"] = plan
-        result["checklist"] = checklist
         result["watcher_text"] = watcher_text
-        result["analysis_explainer"] = state.get("risk_explainer")  # already added earlier
+        result["analysis_explainer"] = state.get("risk_explainer")  # <-- show in UI if you want
+
+        if debug:
+            result["debug"] = debug
+        if flags:
+            result.setdefault("flags", {}).update(flags)
 
         # NEW: forward watcher debug + flags so UI can inspect them
         if debug:
