@@ -1,34 +1,56 @@
-from typing import Dict, List, Tuple, Optional
-from tools.geo import haversine_km
+# agents/planner.py
+from __future__ import annotations
+import json, os, math
+from typing import Dict, Any, Optional, List
 
-DRIVING_SPEED_KMPH = 50.0  # simple demo assumption
+__all__ = ["plan_nearest_open_shelter"]
 
-def _eta_minutes(distance_km: float) -> int:
-    return int(round((distance_km / DRIVING_SPEED_KMPH) * 60))
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
+    return 2 * R * math.asin(math.sqrt(a))
 
-def nearest_open_shelter(zip_code: str, zip_centroids: Dict, shelters: List[Dict]) -> Optional[Dict]:
-    # Unknown ZIP -> no plan
-    if zip_code not in zip_centroids:
+def _load_shelters(path: str) -> List[Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def plan_nearest_open_shelter(
+    zip_point: Optional[Dict[str, float]],
+    data_dir: str,
+    driving_kmh: float = 45.0
+) -> Optional[Dict[str, Any]]:
+    """
+    Returns the nearest OPEN shelter and ETA from zip_point.
+    Expects data/shelters.json entries like:
+    [
+      {"name":"Miami Central High Gym","lat":25.835,"lon":-80.230,"is_open":true},
+      ...
+    ]
+    """
+    if not zip_point:
         return None
-    
-    z = zip_centroids[zip_code]
-    best: Tuple[float, Dict] | None = None
 
-    for s in shelters:
-        if not s.get("is_open", False):
-            continue
-        d = haversine_km(z["lat"], z["lon"], s["lat"], s["lon"])
-        if best is None or d < best[0]:
-            best = (d, s)
-
-    if best is None:
+    zlat, zlon = float(zip_point["lat"]), float(zip_point["lon"])
+    shelters_path = os.path.join(data_dir, "shelters.json")
+    shelters = _load_shelters(shelters_path)
+    open_shelters = [s for s in shelters if s.get("is_open", False)]
+    if not open_shelters:
         return None
-    
-    distance_km, shelter = best
-    return {
-        "name": shelter["name"],
-        "distance_km": distance_km,
-        "eta_min": _eta_minutes(distance_km),
-        "lat": shelter["lat"],
-        "lon": shelter["lon"],
-    }
+
+    best = None
+    for s in open_shelters:
+        slat, slon = float(s["lat"]), float(s["lon"])
+        dist = _haversine_km(zlat, zlon, slat, slon)
+        if best is None or dist < best["distance_km"]:
+            best = {
+                "name": s["name"],
+                "lat": slat,
+                "lon": slon,
+                "distance_km": round(dist, 1),
+            }
+
+    eta_min = int(max(2, round(best["distance_km"] / driving_kmh * 60)))
+    best["eta_min"] = eta_min
+    return best

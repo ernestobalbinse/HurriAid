@@ -1,42 +1,37 @@
-from typing import Dict, List
+# agents/communicator.py
+from __future__ import annotations
+from typing import List
 
-BASE_ITEMS = [
-    "Water (3 days)",
-    "Non-perishable food",
-    "Medications",
-    "Flashlight & batteries",
-    "First aid kit",
-    "Important documents in a waterproof bag",
-]
+def checklist_for_risk(risk: str) -> List[str]:
+    """Deterministic, risk-aware checklist (English only)."""
+    risk = (risk or "").upper()
 
-RISK_EXTRAS = {
-    "MEDIUM": [
+    base = [
+        "Water (3 days)",
+        "Non-perishable food",
+        "Medications",
+        "Flashlight & batteries",
+        "First aid kit",
+        "Important documents in a waterproof bag",
         "Charge power banks",
         "Refuel vehicle to > 1/2 tank",
+    ]
+    medium = [
         "Check evacuation routes",
-    ],
-    "HIGH": [
-        "Pack go-bag (ID, cash, meds)",
         "Secure windows/doors",
+        "Pack go-bag (ID, cash, meds)",
+    ]
+    high = [
         "Plan to evacuate if officials advise",
-    ],
-}
+        "Move to higher ground if flooding risk",
+        "Keep radio/alerts on",
+    ]
 
-def build_checklist(analysis: Dict) -> List[str]:
-    """Return an ordered, de-duplicated preparedness checklist.
-    If risk == ERROR, return empty list (UI will hide checklist).
-    """
-    risk = (analysis or {}).get("risk", "LOW").upper()
-    if risk == "ERROR":
-        return []
-    items = list(BASE_ITEMS)
-    if risk in ("MEDIUM", "HIGH"):
-        items.extend(RISK_EXTRAS.get("MEDIUM", []))
     if risk == "HIGH":
-        items.extend(RISK_EXTRAS.get("HIGH", []))
-    seen, ordered = set(), []
-    for it in items:
-        if it not in seen:
-            seen.add(it)
-            ordered.append(it)
-    return ordered
+        return base + medium + high
+    if risk == "MEDIUM":
+        return base + medium
+    if risk in ("LOW", "SAFE"):
+        return base
+    # Unknown = conservative
+    return base + medium
