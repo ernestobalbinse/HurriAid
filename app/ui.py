@@ -26,6 +26,9 @@ try:
 except Exception:
     pass
 
+# --- Namespace used for all widget/session keys ---
+APP_NS = "v8"
+
 # --- Runtime sanity check (AI Studio only) ---
 if not os.getenv("GOOGLE_API_KEY"):
     st.error(
@@ -62,17 +65,15 @@ div[data-testid="stForm"] > div{
 </style>
 """, unsafe_allow_html=True)
 
-
 # --- Keep page position (stop jumping to top on rerun) ---
-APP_NS = "v8"  # namespace
 components.html(f"""
 <script>
-(function() {{
+(function(){{
   const KEY = '{APP_NS}_scrollY';
-  function save() {{
+  function save(){{
     try {{ sessionStorage.setItem(KEY, String(window.scrollY)); }} catch (e) {{}}
   }}
-  function load() {{
+  function load(){{
     try {{
       const y = parseFloat(sessionStorage.getItem(KEY) || '0');
       if (!isNaN(y)) {{
@@ -95,18 +96,29 @@ components.html(f"""
 </script>
 """, height=0)
 
+# --- Title placeholder (persists across quick reruns so it doesn't "disappear") ---
+_title_box = st.container()
+
 # ---------------- Sidebar (single block, unique keys) ----------------
-zip_code = st.sidebar.text_input("Enter ZIP code", value="33101", key=f"{APP_NS}_zip")
+zip_key = f"{APP_NS}_zip"
+zip_code = st.sidebar.text_input("Enter ZIP code", value=st.session_state.get(zip_key, "33101"), key=zip_key)
 update_now = st.sidebar.button("Update Now", key=f"{APP_NS}_update")
 
-# Live Watcher (always on) above Demo Mode
+# --- Live Watcher controls
 st.sidebar.markdown("---")
 st.sidebar.subheader("Live Watcher")
 watch_interval = st.sidebar.slider(
     "Check storm data every (seconds)", 5, 120, 20, key=f"{APP_NS}_watch_interval"
 )
 
-# Flags for LLM / cooldown to avoid race with autorefresh
+# --- Other settings
+st.sidebar.markdown("---")
+st.sidebar.subheader("Settings")
+show_map = st.sidebar.toggle("Show Map", value=True, key=f"{APP_NS}_show_map")
+show_verifier = st.sidebar.toggle("Show Verifier", value=True, key=f"{APP_NS}_show_verifier")
+
+# ---------------- Autorefresh orchestration ----------------
+# Flags for LLM / cooldown (insulate Live Watcher from Rumor Check work)
 if "llm_busy" not in st.session_state:
     st.session_state.llm_busy = False
 if "llm_cooldown_until" not in st.session_state:
@@ -115,33 +127,7 @@ if "llm_cooldown_until" not in st.session_state:
 now = time.time()
 allow_autorefresh = (not st.session_state.llm_busy) and (now >= st.session_state.llm_cooldown_until)
 if allow_autorefresh:
-    st_autorefresh(interval=watch_interval * 1000, key=f"{APP_NS}_watch_loop")
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Demo Mode")
-demo_mode = st.sidebar.toggle(
-    "Demo Mode", value=False, help="Cycles ZIPs automatically", key=f"{APP_NS}_demo_mode"
-)
-demo_interval = st.sidebar.slider(
-    "Demo step (seconds)", 5, 120, 12, key=f"{APP_NS}_demo_interval"
-)
-DEFAULT_DEMO_ZIPS = ["33101", "33012", "33301", "33401"]
-demo_zips = DEFAULT_DEMO_ZIPS
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Settings")
-show_map = st.sidebar.toggle("Show Map", value=True, key=f"{APP_NS}_show_map")
-show_verifier = st.sidebar.toggle("Show Verifier", value=True, key=f"{APP_NS}_show_verifier")
-
-# --- Demo index & behavior ---
-if "demo_idx" not in st.session_state:
-    st.session_state.demo_idx = 0
-if demo_mode:
-    count = st_autorefresh(interval=demo_interval * 1000, key=f"{APP_NS}_demo_loop")
-    if count is not None:
-        st.session_state.demo_idx = (st.session_state.demo_idx + 1) % len(demo_zips)
-        zip_code = demo_zips[st.session_state.demo_idx]
-        st.session_state[f"{APP_NS}_zip"] = zip_code  # keep input in sync
+    st_autorefresh(interval=watch_interval * 1000, key=f"{APP_NS}_watch_loop", limit=None)
 
 # ---------------- Coordinator (ADK mandatory) ----------------
 if "coordinator" not in st.session_state:
@@ -166,7 +152,7 @@ if "persisted_history" not in st.session_state:
 
 # ---------------- Run triggers ----------------
 zip_changed = (st.session_state.get("last_zip") != zip_code)
-should_run = ("last_result" not in st.session_state) or update_now or zip_changed or demo_mode
+should_run = ("last_result" not in st.session_state) or update_now or zip_changed
 
 if should_run:
     if coord is None:
@@ -204,9 +190,10 @@ if errors.get("adk"):
     st.error("Google ADK is required: " + errors["adk"])
     st.stop()
 
-# ---------------- Header ----------------
-st.markdown("<h1 style='margin:0'>HurriAid</h1>", unsafe_allow_html=True)
-st.caption(f"Last opened: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+# ---------------- Header (persistent) ----------------
+with _title_box:
+    st.markdown("<h1 style='margin:0'>HurriAid</h1>", unsafe_allow_html=True)
+    st.caption(f"Last opened: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # Chips row
 chips = []
@@ -351,59 +338,83 @@ with left_span:
 
 st.markdown("")  # spacer
 
-# ===================== AI Rumor Check (FORM with cooldown) =====================
+# ========== AI Rumor Check (FORM-BASED, ATOMIC SUBMIT; insulated from Live Watcher) ==========
 if show_verifier:
     st.subheader("AI Rumor Check")
-
     if analysis.get("risk") == "ERROR":
         st.info("Verifier is disabled because the ZIP is invalid/unknown.")
     else:
-        LLM_RESULT_KEY = f"{APP_NS}_llm_result"
-        LLM_NONCE_KEY  = f"{APP_NS}_llm_nonce"
+        APP_FORM_KEY     = f"{APP_NS}_llm_form"
+        LLM_TEXT_KEY     = f"{APP_NS}_llm_text"
+        LLM_PENDING_CLR  = f"{APP_NS}_llm_text_pending_clear"
+        LLM_RESULT_KEY   = f"{APP_NS}_llm_result"
+        LLM_LAST_QUERY   = f"{APP_NS}_llm_last_query"
 
-        if LLM_NONCE_KEY not in st.session_state:
-            st.session_state[LLM_NONCE_KEY] = 0
-        nonce = st.session_state[LLM_NONCE_KEY]
+        # Persistent cache across runs
+        llm_cache = st.session_state.setdefault("llm_rumor_cache", {})
 
-        with st.form(key=f"{APP_NS}_llm_form_{nonce}"):
-            st.caption("Enter statements or rumors to verify with the LLM (one per line).")
+        # If a clear was requested in the previous run, clear the widget state BEFORE rendering the widget.
+        if st.session_state.get(LLM_PENDING_CLR):
+            st.session_state[LLM_TEXT_KEY] = ""
+            st.session_state.pop(LLM_PENDING_CLR, None)
+
+        st.caption("Enter statements or rumors to verify with the LLM (one per line).")
+
+        with st.form(APP_FORM_KEY, clear_on_submit=False):
             llm_text = st.text_area(
                 "Rumor(s) to verify",
-                value="",
-                key=f"{APP_NS}_llm_text_{nonce}",
+                value=st.session_state.get(LLM_TEXT_KEY, ""),
+                key=LLM_TEXT_KEY,
                 help="Examples: 'drink seawater' (False), 'drink water' (True), 'taping windows' (Misleading).",
             )
-            c1, c2 = st.columns([1, 1])
-            submit_check = c1.form_submit_button("Check with LLM")
-            clear_btn    = c2.form_submit_button("Clear")
+            colA, colB, _ = st.columns([1, 1, 6])
+            with colA:
+                submit_check = st.form_submit_button("Check with LLM")
+            with colB:
+                submit_clear = st.form_submit_button("Clear")
 
-        if clear_btn:
+        # Handle Clear: mark pending clear and rerun so the text_area is rebuilt with an empty value
+        if submit_clear:
             st.session_state.pop(LLM_RESULT_KEY, None)
-            st.session_state[LLM_NONCE_KEY] += 1
+            st.session_state.pop(LLM_LAST_QUERY, None)
+            st.session_state[LLM_PENDING_CLR] = True
             st.rerun()
 
+        # Normalize current query (lines -> items)
+        items = [line.strip() for line in (llm_text or "").splitlines() if line.strip()]
+        key_joined = "\n".join(items)
+
+        # Handle Check: compute fresh result for the *current* text, pausing Live Watcher during the call
         if submit_check:
-            items = [line.strip() for line in (llm_text or "").splitlines() if line.strip()]
             if not items:
-                st.info("Type at least one rumor to verify.")
+                # Empty box: clear any previous result instead of showing stale data
+                st.session_state.pop(LLM_RESULT_KEY, None)
+                st.session_state[LLM_LAST_QUERY] = ""
             else:
-                # Enter busy + set cooldown to block autorefresh during and shortly after the call
+                # Pause Live Watcher while LLM runs + small cooldown after
                 st.session_state.llm_busy = True
                 st.session_state.llm_cooldown_until = time.time() + max(3.0, watch_interval * 0.9)
                 try:
-                    res = verify_items_with_llm(items)
+                    if key_joined in llm_cache:
+                        res = llm_cache[key_joined]
+                    else:
+                        res = verify_items_with_llm(items)
+                        llm_cache[key_joined] = res
                 finally:
                     st.session_state.llm_busy = False
-                    # Give a little extra buffer after finishing
+                    # Ensure we keep Live Watcher off just a bit longer to render result stably
                     st.session_state.llm_cooldown_until = max(
                         st.session_state.llm_cooldown_until, time.time() + 2.0
                     )
                 st.session_state[LLM_RESULT_KEY] = res
+                st.session_state[LLM_LAST_QUERY] = key_joined
 
-        # Show last result if any
+        # Render result
         llm_live = st.session_state.get(LLM_RESULT_KEY)
-        if not llm_live:
-            st.info("Enter rumor text above and click **Check with LLM**.")
+        if not items and not llm_live:
+            st.info("Type something and click **Check with LLM**.")
+        elif not llm_live:
+            st.info("Click **Check with LLM** to verify.")
         else:
             VERDICT_LABELS = {
                 "TRUE": "True", "FALSE": "False", "MISLEADING": "Misleading",
@@ -419,20 +430,24 @@ if show_verifier:
             matches = llm_live.get("matches", [])
 
             overall_display = VERDICT_LABELS.get(overall, overall_raw.title())
-            box = st.info
-            if overall == "SAFE": box = st.success
-            elif overall == "FALSE": box = st.error
-            elif overall in ("MISLEADING", "CAUTION"): box = st.warning
-            elif overall == "ERROR": box = st.error
-            box(f"Verifier result: {overall_display}")
 
             if overall == "ERROR":
-                msg = (llm_live.get("error") or "LLM error.")
-                st.error(msg)
+                msg = (llm_live.get("error") or "")
+                umsg = msg.upper()
+                if any(k in umsg for k in ("API KEY NOT VALID", "API_KEY_INVALID")):
+                    st.error("API key invalid/restricted. Set GOOGLE_API_KEY for local dev.")
+                elif any(k in umsg for k in ("UNAVAILABLE", "OVERLOADED", "503", "TIMEOUT")):
+                    st.warning("The model is busy. Please try again shortly.")
+                else:
+                    st.error(msg or "LLM error.")
+            elif (overall in ("CLEAR", "SAFE")) and not matches:
+                st.success("No rumor flags detected.")
             else:
+                box = st.success if overall == "SAFE" else (st.error if overall == "FALSE" else st.warning)
+                box(f"Verifier result: {overall_display}")
                 for m in matches:
                     note = de_shout(m.get("note",""))
-                    st.markdown(f"- **Rumor:** {m.get('pattern','')} — {note}")
+                    st.markdown(f"- **Rumor:** {m['pattern']} — {note}")
 
 # Collapsibles
 with st.expander("Advisory (details)", expanded=False):
