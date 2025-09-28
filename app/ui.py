@@ -26,7 +26,7 @@ try:
 except Exception:
     pass
 
-# --- Namespace used for all widget/session keys ---
+# --- Namespace used for all widget/session keys (declare early) ---
 APP_NS = "v8"
 
 # --- Runtime sanity check (AI Studio only) ---
@@ -38,6 +38,13 @@ if not os.getenv("GOOGLE_API_KEY"):
         '$env:GOOGLE_API_KEY = "<YOUR_KEY>"\n'
     )
     st.stop()
+
+# --- Apply any pending ZIP change BEFORE the text_input widget is created ---
+_pending_key = f"{APP_NS}_pending_zip"
+zip_key = f"{APP_NS}_zip"
+if _pending_key in st.session_state:
+    st.session_state[zip_key] = st.session_state[_pending_key]
+    del st.session_state[_pending_key]
 
 # --- Global style tweaks + remove form box for Rumor Check ---
 st.markdown("""
@@ -66,52 +73,47 @@ div[data-testid="stForm"] > div{
 """, unsafe_allow_html=True)
 
 # --- Keep page position (stop jumping to top on rerun) ---
-components.html(f"""
+components.html("""
 <script>
-(function(){{
-  const KEY = '{APP_NS}_scrollY';
-  function save(){{
-    try {{ sessionStorage.setItem(KEY, String(window.scrollY)); }} catch (e) {{}}
-  }}
-  function load(){{
-    try {{
+(function(){
+  const KEY = 'v8_scrollY';
+  function save(){
+    try { sessionStorage.setItem(KEY, String(window.scrollY)); } catch (e) {}
+  }
+  function load(){
+    try {
       const y = parseFloat(sessionStorage.getItem(KEY) || '0');
-      if (!isNaN(y)) {{
-        window.scrollTo(0, y);
-      }}
-    }} catch (e) {{}}
-  }}
-  window.addEventListener('load', () => {{
+      if (!isNaN(y)) { window.scrollTo(0, y); }
+    } catch (e) {}
+  }
+  window.addEventListener('load', () => {
     load();
     setTimeout(load, 120);
     setTimeout(load, 400);
     setTimeout(load, 800);
-  }});
+  });
   ['click','wheel','touchstart','keydown','scroll'].forEach(ev =>
-    window.addEventListener(ev, save, {{ passive: true, capture: true }})
+    window.addEventListener(ev, save, { passive: true, capture: true })
   );
   document.addEventListener('submit', save, true);
   window.addEventListener('beforeunload', save);
-}})();
+})();
 </script>
 """, height=0)
 
 # --- Title placeholder (persists across quick reruns so it doesn't "disappear") ---
 _title_box = st.container()
 
-# ---------------- Sidebar (single block, unique keys) ----------------
-zip_key = f"{APP_NS}_zip"
+# ---------------- Sidebar ----------------
 zip_code = st.sidebar.text_input("Enter ZIP code", value=st.session_state.get(zip_key, "33101"), key=zip_key)
 update_now = st.sidebar.button("Update Now", key=f"{APP_NS}_update")
 
-# --- Live Watcher controls
 st.sidebar.markdown("---")
 st.sidebar.subheader("Live Watcher")
 watch_interval = st.sidebar.slider(
     "Check storm data every (seconds)", 5, 120, 20, key=f"{APP_NS}_watch_interval"
 )
 
-# --- Other settings
 st.sidebar.markdown("---")
 st.sidebar.subheader("Settings")
 show_map = st.sidebar.toggle("Show Map", value=True, key=f"{APP_NS}_show_map")
@@ -124,10 +126,18 @@ if "llm_busy" not in st.session_state:
 if "llm_cooldown_until" not in st.session_state:
     st.session_state.llm_cooldown_until = 0.0
 
-now = time.time()
-allow_autorefresh = (not st.session_state.llm_busy) and (now >= st.session_state.llm_cooldown_until)
-if allow_autorefresh:
-    st_autorefresh(interval=watch_interval * 1000, key=f"{APP_NS}_watch_loop", limit=None)
+# Generation key for the Live Watcher timer. Bump this to cancel any existing timer immediately.
+REF_GEN = f"{APP_NS}_watch_gen"
+st.session_state.setdefault(REF_GEN, 0)
+
+def render_watch_timer():
+    allow = (not st.session_state.llm_busy) and (time.time() >= st.session_state.llm_cooldown_until)
+    if allow:
+        st_autorefresh(
+            interval=watch_interval * 1000,
+            key=f"{APP_NS}_watch_loop_{st.session_state[REF_GEN]}",
+            limit=None
+        )
 
 # ---------------- Coordinator (ADK mandatory) ----------------
 if "coordinator" not in st.session_state:
@@ -353,7 +363,7 @@ if show_verifier:
         # Persistent cache across runs
         llm_cache = st.session_state.setdefault("llm_rumor_cache", {})
 
-        # If a clear was requested in the previous run, clear the widget state BEFORE rendering the widget.
+        # If a clear was requested previously, clear widget state BEFORE rendering the widget.
         if st.session_state.get(LLM_PENDING_CLR):
             st.session_state[LLM_TEXT_KEY] = ""
             st.session_state.pop(LLM_PENDING_CLR, None)
@@ -373,7 +383,7 @@ if show_verifier:
             with colB:
                 submit_clear = st.form_submit_button("Clear")
 
-        # Handle Clear: mark pending clear and rerun so the text_area is rebuilt with an empty value
+        # Handle Clear
         if submit_clear:
             st.session_state.pop(LLM_RESULT_KEY, None)
             st.session_state.pop(LLM_LAST_QUERY, None)
@@ -384,14 +394,15 @@ if show_verifier:
         items = [line.strip() for line in (llm_text or "").splitlines() if line.strip()]
         key_joined = "\n".join(items)
 
-        # Handle Check: compute fresh result for the *current* text, pausing Live Watcher during the call
+        # Handle Check (pause Live Watcher; cancel any existing timer by bumping generation)
         if submit_check:
             if not items:
-                # Empty box: clear any previous result instead of showing stale data
                 st.session_state.pop(LLM_RESULT_KEY, None)
                 st.session_state[LLM_LAST_QUERY] = ""
             else:
-                # Pause Live Watcher while LLM runs + small cooldown after
+                # Cancel current autorefresh immediately
+                st.session_state[REF_GEN] += 1
+
                 st.session_state.llm_busy = True
                 st.session_state.llm_cooldown_until = time.time() + max(3.0, watch_interval * 0.9)
                 try:
@@ -402,7 +413,6 @@ if show_verifier:
                         llm_cache[key_joined] = res
                 finally:
                     st.session_state.llm_busy = False
-                    # Ensure we keep Live Watcher off just a bit longer to render result stably
                     st.session_state.llm_cooldown_until = max(
                         st.session_state.llm_cooldown_until, time.time() + 2.0
                     )
@@ -503,3 +513,6 @@ with st.expander("History", expanded=False):
             st.caption(f"{len(raw_hist)} run(s) in this session.")
     else:
         st.caption("No session runs yet.")
+
+# ---- Mount the Live Watcher timer last (so it cannot interrupt UI while rendering) ----
+render_watch_timer()
