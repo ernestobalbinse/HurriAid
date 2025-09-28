@@ -19,7 +19,7 @@ class Coordinator:
         state.setdefault("timings_ms", {}).update(watch_timings)
 
         # 2) Parallel (checklist + planner)
-        state, par_timings = run_parallel_once(self.data_dir, state, zip_code)
+        state, par_timings = run_parallel_once(self.data_dir, zip_code, state)
         state["timings_ms"].update(par_timings)
         state["timings_ms"]["total_ms"] = (time.perf_counter() - t0) * 1000.0
 
