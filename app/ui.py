@@ -231,22 +231,6 @@ with col_left:
                 bullets.append(f"- **Advisory area:** {where} (radius ≈ {float(radius_km):.1f} km)")
             st.markdown("\n".join(bullets))
 
-
-    # DEBUG — remove after inspection
-    st.code(f"raw_explainer = {repr((result.get('debug') or {}).get('risk_explainer_raw'))}", language="text")
-
-    dbg = result.get("debug") or {}
-    st.code("explainer_debug = " + repr({
-        "ai": result.get("flags", {}).get("risk_explainer_ai"),
-        "error": dbg.get("risk_explainer_error"),
-        "events": dbg.get("risk_explainer_events"),
-        "raw": dbg.get("risk_explainer_raw"),
-    }), language="text")
-
-    # DEBUG
-    dbg = result.get("debug") or {}
-    st.code("watcher_impl = " + repr(dbg.get("watcher_impl")), language="text")
-
     # --- AI explainer (one sentence) ---
     expl = result.get("analysis_explainer")
     if isinstance(expl, str) and expl.strip():

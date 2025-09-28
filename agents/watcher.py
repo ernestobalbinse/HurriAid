@@ -6,6 +6,8 @@ import os
 import math
 import time
 from typing import Dict, Any, Tuple, Optional
+import secrets, re  # add to your imports at the top
+
 
 # ---- pgeocode for ZIP -> lat/lon ----
 try:
@@ -19,6 +21,19 @@ except Exception:
 def _load_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+    
+# Helper: extract first JSON object from a model response
+def _json_from_text(s: str):
+    if not isinstance(s, str):
+        return None
+    m = re.search(r"\{.*\}", s.strip(), re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
 
 def _resolve_zip_from_helper(zip_code: str) -> Optional[Tuple[float, float]]:
     """Use project helper if present."""
@@ -216,7 +231,7 @@ def _step_analyze_risk(state: Dict[str, Any], zip_code: str, timings: Dict[str, 
     timings["watcher_ms_analyze"] = (time.perf_counter() - t0) * 1000.0
 
 def _step_explain_risk(state: Dict[str, Any], zip_code: str, timings: Dict[str, float]) -> None:
-    """Call LLM explainer; fall back deterministically; store debug."""
+    """AI-only explainer with nonce proof: the model must return JSON containing the exact nonce."""
     t0 = time.perf_counter()
     adv = state.get("advisory") or {}
     analysis = state.get("analysis") or {}
@@ -231,41 +246,47 @@ def _step_explain_risk(state: Dict[str, Any], zip_code: str, timings: Dict[str, 
     radius_km = (adv or {}).get("radius_km", "")
     category = (adv or {}).get("category", "")
 
+    # --- Generate a per-call nonce and store it in debug so you can inspect later
+    nonce = secrets.token_hex(4)  # e.g., 'a3f9c1b2'
+    dbg = state.setdefault("debug", {})
+    dbg["risk_explainer_nonce"] = nonce
+
+    # --- Prompt requires strict, minified JSON with the nonce echoed in "proof"
     prompt = (
-        f"ZIP: {zip_code}\n"
-        f"RISK: {risk}\n"
-        f"DIST_KM: {dist_km}\n"
-        f"RADIUS_KM: {radius_km}\n"
-        f"CATEGORY: {category}\n"
-        "Return ONE sentence (<=25 words) and start it with '🧠 AI: '."
+        "You are a hurricane risk explainer. You will be given ZIP, risk, distance (km), advisory radius (km), and category.\n"
+        "Respond with STRICT MINIFIED JSON(no code fences, no extra text):\n"
+        f'{{"AI: <ONE sentence (<=25 words) explaining the risk>",'
+        f'"proof":"{nonce}"}}\n'
+        "Rules:\n"
+        "- Length <= 25 words.\n"
+        "- Return ONLY the JSON object (minified). No markdown, no explanations."
+        f"\n\nZIP: {zip_code}\nRISK: {risk}\nDIST_KM: {dist_km}\nRADIUS_KM: {radius_km}\nCATEGORY: {category}"
     )
 
+    # Try ADK first, then direct SDKs; do NOT fabricate fallback text
     raw_text, ev_summ, err_str, backend = _call_risk_explainer_ai(prompt)
 
     used_ai = False
     text: Optional[str] = None
-    if isinstance(raw_text, str) and raw_text.strip():
-        text = raw_text.strip()
-        if not text.startswith("🧠 AI:"):
-            text = "🧠 AI: " + text
-        used_ai = True
 
-    if not used_ai:
-        # Deterministic fallback (no 🧠 prefix)
-        inside = (
-            isinstance(dist_km, (int, float))
-            and isinstance(radius_km, (int, float))
-            and float(dist_km) <= float(radius_km)
-        )
-        where = "inside" if inside else "outside"
-        text = f"Risk is {risk} because ZIP {zip_code} is {where} the advisory radius and {dist_km} km from the storm center."
+    # Parse and validate proof
+    data = _json_from_text(raw_text) if raw_text else None
+    if isinstance(data, dict) and data.get("proof") == nonce and isinstance(data.get("why"), str):
+        candidate = data["why"].strip()
+        # Only check length; no prefix requirement
+        if len(candidate.split()) <= 28:
+            text = candidate
+            used_ai = True
+        else:
+            err_str = err_str or "AI_PROOF_OK_BUT_TOO_LONG"
+    else:
+        err_str = err_str or "AI_PROOF_FAIL"
 
-    # Outputs + debug
+
+    # Outputs + debug (AI-only; if invalid, text stays None)
     state["risk_explainer"] = text
     state.setdefault("flags", {})["risk_explainer_ai"] = used_ai
 
-    dbg = state.setdefault("debug", {})
-    dbg["watcher_impl"] = "shim-functional-v1"
     dbg["risk_explainer_raw"] = raw_text
     dbg["risk_explainer_prompt"] = prompt
     dbg["risk_explainer_events"] = ev_summ
@@ -274,6 +295,7 @@ def _step_explain_risk(state: Dict[str, Any], zip_code: str, timings: Dict[str, 
         dbg["risk_explainer_error"] = err_str
 
     timings["explainer_ms"] = (time.perf_counter() - t0) * 1000.0
+
 
 # ---------- Public API used by Coordinator/UI ----------
 
