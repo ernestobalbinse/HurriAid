@@ -1,6 +1,5 @@
 # ---- Standard library ----
-import os
-import time
+import sys, os
 from datetime import datetime
 from urllib.parse import urlencode
 
@@ -9,7 +8,11 @@ import streamlit as st
 import streamlit.components.v1 as components
 st.set_page_config(page_title="HurriAid", layout="wide", initial_sidebar_state="expanded")
 import pydeck as pdk
-from streamlit_autorefresh import st_autorefresh
+
+# --- repo root on sys.path so 'core', 'agents', 'tools' resolve when run from app/ ---
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 # ---- Project modules ----
 from core.parallel_exec import ADKNotAvailable
@@ -26,7 +29,7 @@ try:
 except Exception:
     pass
 
-# --- Namespace used for all widget/session keys (declare early) ---
+# --- Namespace used for all widget/session keys ---
 APP_NS = "v8"
 
 # --- Runtime sanity check (AI Studio only) ---
@@ -62,7 +65,6 @@ div[data-testid="stForm"]{
   padding: 0 !important;
   margin: 0 !important;
 }
-/* Also remove the inner padding wrapper */
 form[data-testid="stForm"] > div,
 section[data-testid="stForm"] > div,
 div[data-testid="stForm"] > div{
@@ -77,9 +79,7 @@ components.html("""
 <script>
 (function(){
   const KEY = 'v8_scrollY';
-  function save(){
-    try { sessionStorage.setItem(KEY, String(window.scrollY)); } catch (e) {}
-  }
+  function save(){ try { sessionStorage.setItem(KEY, String(window.scrollY)); } catch (e) {} }
   function load(){
     try {
       const y = parseFloat(sessionStorage.getItem(KEY) || '0');
@@ -104,40 +104,14 @@ components.html("""
 # --- Title placeholder (persists across quick reruns so it doesn't "disappear") ---
 _title_box = st.container()
 
-# ---------------- Sidebar ----------------
+# ---------------- Sidebar (no Live Watcher) ----------------
 zip_code = st.sidebar.text_input("Enter ZIP code", value=st.session_state.get(zip_key, "33101"), key=zip_key)
 update_now = st.sidebar.button("Update Now", key=f"{APP_NS}_update")
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Live Watcher")
-watch_interval = st.sidebar.slider(
-    "Check storm data every (seconds)", 5, 120, 20, key=f"{APP_NS}_watch_interval"
-)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Settings")
 show_map = st.sidebar.toggle("Show Map", value=True, key=f"{APP_NS}_show_map")
 show_verifier = st.sidebar.toggle("Show Verifier", value=True, key=f"{APP_NS}_show_verifier")
-
-# ---------------- Autorefresh orchestration ----------------
-# Flags for LLM / cooldown (insulate Live Watcher from Rumor Check work)
-if "llm_busy" not in st.session_state:
-    st.session_state.llm_busy = False
-if "llm_cooldown_until" not in st.session_state:
-    st.session_state.llm_cooldown_until = 0.0
-
-# Generation key for the Live Watcher timer. Bump this to cancel any existing timer immediately.
-REF_GEN = f"{APP_NS}_watch_gen"
-st.session_state.setdefault(REF_GEN, 0)
-
-def render_watch_timer():
-    allow = (not st.session_state.llm_busy) and (time.time() >= st.session_state.llm_cooldown_until)
-    if allow:
-        st_autorefresh(
-            interval=watch_interval * 1000,
-            key=f"{APP_NS}_watch_loop_{st.session_state[REF_GEN]}",
-            limit=None
-        )
 
 # ---------------- Coordinator (ADK mandatory) ----------------
 if "coordinator" not in st.session_state:
@@ -160,7 +134,7 @@ if "persisted_history" not in st.session_state:
     except Exception:
         st.session_state.persisted_history = []
 
-# ---------------- Run triggers ----------------
+# ---------------- Run triggers (manual only) ----------------
 zip_changed = (st.session_state.get("last_zip") != zip_code)
 should_run = ("last_result" not in st.session_state) or update_now or zip_changed
 
@@ -347,7 +321,7 @@ with left_span:
 
 st.markdown("")  # spacer
 
-# ========== AI Rumor Check (FORM-BASED, ATOMIC SUBMIT; insulated from Live Watcher) ==========
+# ========== AI Rumor Check (FORM-BASED, ATOMIC SUBMIT) ==========
 if show_verifier:
     st.subheader("AI Rumor Check")
     if analysis.get("risk") == "ERROR":
@@ -359,10 +333,9 @@ if show_verifier:
         LLM_RESULT_KEY   = f"{APP_NS}_llm_result"
         LLM_LAST_QUERY   = f"{APP_NS}_llm_last_query"
 
-        # Persistent cache across runs
         llm_cache = st.session_state.setdefault("llm_rumor_cache", {})
 
-        # If a clear was requested previously, clear widget state BEFORE rendering the widget.
+        # Clear requested last run? do it BEFORE rendering widget
         if st.session_state.get(LLM_PENDING_CLR):
             st.session_state[LLM_TEXT_KEY] = ""
             st.session_state.pop(LLM_PENDING_CLR, None)
@@ -389,32 +362,21 @@ if show_verifier:
             st.session_state[LLM_PENDING_CLR] = True
             st.rerun()
 
-        # Normalize current query (lines -> items)
+        # Normalize input
         items = [line.strip() for line in (llm_text or "").splitlines() if line.strip()]
         key_joined = "\n".join(items)
 
-        # Handle Check (pause Live Watcher; cancel any existing timer by bumping generation)
+        # Handle Check
         if submit_check:
             if not items:
                 st.session_state.pop(LLM_RESULT_KEY, None)
                 st.session_state[LLM_LAST_QUERY] = ""
             else:
-                # Cancel current autorefresh immediately
-                st.session_state[REF_GEN] += 1
-
-                st.session_state.llm_busy = True
-                st.session_state.llm_cooldown_until = time.time() + max(3.0, watch_interval * 0.9)
-                try:
-                    if key_joined in llm_cache:
-                        res = llm_cache[key_joined]
-                    else:
-                        res = verify_items_with_llm(items)
-                        llm_cache[key_joined] = res
-                finally:
-                    st.session_state.llm_busy = False
-                    st.session_state.llm_cooldown_until = max(
-                        st.session_state.llm_cooldown_until, time.time() + 2.0
-                    )
+                if key_joined in llm_cache:
+                    res = llm_cache[key_joined]
+                else:
+                    res = verify_items_with_llm(items)
+                    llm_cache[key_joined] = res
                 st.session_state[LLM_RESULT_KEY] = res
                 st.session_state[LLM_LAST_QUERY] = key_joined
 
@@ -486,7 +448,7 @@ with st.expander("Agent Status", expanded=False):
     ]
     st.code("\n".join(status_lines), language="text")
 
-# --- History (collapsible, cleaned columns) ---
+# --- History (collapsible) ---
 import pandas as pd
 with st.expander("History", expanded=False):
     raw_hist = st.session_state.get("history", [])
@@ -512,6 +474,3 @@ with st.expander("History", expanded=False):
             st.caption(f"{len(raw_hist)} run(s) in this session.")
     else:
         st.caption("No session runs yet.")
-
-# ---- Mount the Live Watcher timer last (so it cannot interrupt UI while rendering) ----
-render_watch_timer()
