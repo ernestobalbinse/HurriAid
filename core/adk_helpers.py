@@ -1,154 +1,78 @@
 # core/adk_helpers.py
 from __future__ import annotations
-
-import asyncio
 import threading
-from typing import Any, List, Tuple, Optional
+from typing import Optional, Tuple, List, Any
 
+# ADK / GenAI
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
-from google.genai import types
+from google.adk.events import Event
+from google.genai import types as genai_types
 
-# Global session service for the whole app
-_SESSION = InMemorySessionService()
+# ---------- singletons ----------
+_SESSION_LOCK = threading.Lock()
+_SESSION: Optional[InMemorySessionService] = None
 
-def _run_coro_blocking(coro):
-    """
-    Run an async coroutine from sync code, even if we're already inside a running loop.
-    Uses a dedicated thread+event loop when necessary.
-    """
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        # No running loop: safe to asyncio.run
-        return asyncio.run(coro)
-
-    if loop.is_running():
-        # We are already inside an event loop (e.g., Streamlit/ADK threads)
-        result_holder: dict = {}
-        exc_holder: dict = {}
-
-        def _worker():
-            try:
-                new_loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(new_loop)
-                result_holder["value"] = new_loop.run_until_complete(coro)
-                new_loop.close()
-            except Exception as e:
-                exc_holder["error"] = e
-
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
-        t.join()
-        if "error" in exc_holder:
-            raise exc_holder["error"]
-        return result_holder.get("value")
-    else:
-        # Edge case: have a loop object but it's not running
-        return loop.run_until_complete(coro)
-
-def _maybe_call(meth, **kwargs):
-    """
-    Call a session service method that might be sync or async; await when needed.
-    """
-    res = meth(**kwargs)
-    if asyncio.iscoroutine(res):
-        return _run_coro_blocking(res)
-    return res
+def _get_session_service() -> InMemorySessionService:
+    global _SESSION
+    with _SESSION_LOCK:
+        if _SESSION is None:
+            _SESSION = InMemorySessionService()
+    return _SESSION
 
 def ensure_session(app_name: str, user_id: str, session_id: str) -> None:
-    """
-    Ensure (app_name, user_id, session_id) exists in the InMemorySessionService,
-    across ADK versions where get_session/create_session may be async.
-    """
-    # Try to fetch existing
-    get_sess = getattr(_SESSION, "get_session", None)
-    found = None
-    if callable(get_sess):
+    ss = _get_session_service()
+    # ADK's InMemorySessionService methods are async; use its sync helpers if present:
+    # Fallback: tiny compatibility wrapper
+    try:
+        sess = ss.get_session_sync(app_name=app_name, user_id=user_id, session_id=session_id)
+    except AttributeError:
+        # Provide sync behavior using internal store if necessary
         try:
-            found = _maybe_call(get_sess, app_name=app_name, user_id=user_id, session_id=session_id)
+            # available in newer versions
+            sess = ss.get_session(app_name=app_name, user_id=user_id, session_id=session_id)  # type: ignore
         except Exception:
-            found = None
-
-    if found:
-        return
-
-    # Create if missing
-    create = getattr(_SESSION, "create_session", None)
-    if not callable(create):
-        # Fallback: older builds may only expose create_session via other name; in practice it's present.
-        raise RuntimeError("InMemorySessionService.create_session() not available.")
-    _maybe_call(create, app_name=app_name, user_id=user_id, session_id=session_id)
+            sess = None
+    if not sess:
+        try:
+            ss.create_session_sync(app_name=app_name, user_id=user_id, session_id=session_id)
+        except AttributeError:
+            # fallback to async (best-effort)
+            import asyncio
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(ss.create_session(app_name=app_name, user_id=user_id, session_id=session_id))  # type: ignore
+            finally:
+                loop.close()
 
 def run_llm_agent_text_debug(
-    agent: Any,
+    agent,
     prompt: str,
     app_name: str,
     user_id: str,
     session_id: str,
-) -> Tuple[Optional[str], List[str], Optional[str]]:
+) -> Tuple[Optional[str], List[Event], Optional[str]]:
     """
-    Synchronously run an ADK LlmAgent and return (text, events, error).
-
-    - Ensures session exists (handles async/sync APIs).
-    - Iterates over ALL events; captures last seen text as fallback.
-    - Retries ONCE if ADK throws 'Session not found' from the runner thread.
+    Run a single LlmAgent with a text prompt. Returns (final_text, events, error).
+    The agent should have its .instruction set already.
     """
-    def _invoke() -> Tuple[Optional[str], List[str], Optional[str]]:
-        ensure_session(app_name, user_id, session_id)
-        runner = Runner(agent=agent, app_name=app_name, session_service=_SESSION)
+    ensure_session(app_name, user_id, session_id)
+    ss = _get_session_service()
+    runner = Runner(agent=agent, app_name=app_name, session_service=ss)
 
-        content = types.Content(role="user", parts=[types.Part(text=prompt)])
-        try:
-            events_iter = runner.run(user_id=user_id, session_id=session_id, new_message=content)
-        except Exception as e:
-            return None, [], f"GENAI_ERROR {type(e).__name__}: {e}"
+    content = genai_types.Content(role="user", parts=[genai_types.Part(text=prompt)])
+    events: List[Event] = []
+    final_text: Optional[str] = None
+    err: Optional[str] = None
 
-        final_text: Optional[str] = None
-        last_text: Optional[str] = None
-        events_dump: List[str] = []
-        try:
-            for ev in events_iter:
-                etype = getattr(ev, "type", ev.__class__.__name__)
-                events_dump.append(str(etype))
+    try:
+        for ev in runner.run(user_id=user_id, session_id=session_id, new_message=content):
+            events.append(ev)
+            if ev.is_final_response() and ev.content:
+                parts = ev.content.parts or []
+                if parts and getattr(parts[0], "text", None):
+                    final_text = parts[0].text
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
 
-                ev_content = getattr(ev, "content", None)
-                if ev_content and getattr(ev_content, "parts", None):
-                    for part in ev_content.parts:
-                        t = getattr(part, "text", None)
-                        if isinstance(t, str) and t.strip():
-                            last_text = t
-
-                if getattr(ev, "is_final_response", lambda: False)():
-                    if ev_content and getattr(ev_content, "parts", None):
-                        t = getattr(ev_content.parts[0], "text", None)
-                        if isinstance(t, str) and t.strip():
-                            final_text = t
-        except ValueError as ve:
-            # Common ADK thread error bubbles up here sometimes
-            msg = str(ve)
-            if "Session not found" in msg:
-                return None, events_dump, "SESSION_MISSING"
-            return None, events_dump, f"GENAI_ERROR ValueError: {msg}"
-        except Exception as e:
-            return None, events_dump, f"GENAI_ERROR {type(e).__name__}: {e}"
-
-        if not final_text:
-            final_text = last_text
-
-        if not final_text or not final_text.strip():
-            return None, events_dump, "NO_TEXT"
-
-        return final_text, events_dump, None
-
-    # First attempt
-    text, events, err = _invoke()
-    if err == "SESSION_MISSING":
-        # Retry once after re-ensuring session
-        ensure_session(app_name, user_id, session_id)
-        text, events2, err2 = _invoke()
-        # keep all event types we saw
-        events = events + ["--- retry ---"] + events2
-        return text, events, err2
-
-    return text, events, err
+    return final_text, events, err

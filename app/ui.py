@@ -1,10 +1,8 @@
+# app/ui.py
 # ---- Standard library ----
 import sys, os, hashlib
 from datetime import datetime
 from urllib.parse import urlencode
-# add near the top with imports
-import json
-
 
 # ---- Third-party ----
 import streamlit as st
@@ -109,13 +107,12 @@ _title_box = st.container()
 
 # ---------------- Sidebar ----------------
 zip_code = st.sidebar.text_input("Enter ZIP code", value=st.session_state.get(zip_key, "33101"), key=zip_key)
-update_now = st.sidebar.button("Update Now", key=f"{APP_NS}_update")
+update_now = st.sidebar.button("Refresh Status", key=f"{APP_NS}_update")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Settings")
 show_map = st.sidebar.toggle("Show Map", value=True, key=f"{APP_NS}_show_map")
 show_verifier = st.sidebar.toggle("Show Verifier", value=True, key=f"{APP_NS}_show_verifier")
-always_run = st.sidebar.toggle("Force run on every rerun", value=False, key=f"{APP_NS}_always_run")
 
 # ---------------- Coordinator (ADK mandatory) ----------------
 if "coordinator" not in st.session_state:
@@ -139,7 +136,7 @@ if "persisted_history" not in st.session_state:
     except Exception:
         st.session_state.persisted_history = []
 
-# ---------------- Advisory file path / change detection ----------------
+# ---------------- Advisory file change detection ----------------
 def _advisory_path():
     return os.path.join(ROOT, "data", "sample_advisory.json")
 
@@ -171,43 +168,51 @@ if curr_mtime is not None:
 if curr_sig is not None:
     st.session_state[f"{APP_NS}_adv_sig"] = curr_sig
 
-# ---------------- Run triggers (manual + file change + zip change + optional force) ----------------
+# ---------------- Run triggers (manual + file change + zip change) ----------------
 zip_changed = (st.session_state.get("last_zip") != zip_code)
-should_run = True if always_run else (("last_result" not in st.session_state) or update_now or zip_changed or file_changed)
+should_run = ("last_result" not in st.session_state) or update_now or zip_changed or file_changed
 
 if should_run:
     if coord is None:
         st.error("Coordinator not available (ADK error).")
         st.stop()
 
-    result = coord.run_once(zip_code)
-    st.session_state.last_result = result
+    res = coord.run_once(zip_code)
+
+    # Always store a dict so UI never crashes
+    if not isinstance(res, dict):
+        res = {"errors": {"coordinator": "Coordinator.run_once returned None"}, "timings_ms": {}}
+
+    st.session_state.last_result = res
     st.session_state.last_zip = zip_code
     st.session_state.last_run = datetime.now().strftime("%H:%M:%S")
 
     # History row
     hist = st.session_state.get("history", [])
     adk_ok = not st.session_state.get("adk_error")
-    analysis = (result.get("analysis") or {})
-    plan = result.get("plan") or {}
+    analysis = (res.get("analysis") or {})
+    plan = res.get("plan") or {}
     hist.append({
         "time": st.session_state.last_run,
         "zip": zip_code,
         "risk": analysis.get("risk", "—"),
         "eta": plan.get("eta_min", "—"),
-        "llm": "Gemini",
+        "llm": "Google Gemini",
         "adk": "ON" if adk_ok else "ERROR",
     })
     st.session_state["history"] = hist[-12:]
 
 # ---------------- Unpack result ----------------
-result = st.session_state.get("last_result", {}) or {}
-advisory = result.get("advisory", {}) or {}
-analysis = result.get("analysis", {}) or {}
-plan = result.get("plan")
-checklist = result.get("checklist", []) or []
-timings = result.get("timings_ms", {}) or {}
-errors = result.get("errors", {}) or {}
+result = st.session_state.get("last_result") or {}
+if not isinstance(result, dict):
+    result = {}
+
+advisory  = result.get("advisory") or {}
+analysis  = result.get("analysis") or {}
+plan      = result.get("plan") or {}
+checklist = result.get("checklist") or []
+timings   = result.get("timings_ms") or {}
+errors    = result.get("errors") or {}
 zip_point = result.get("zip_point")
 
 if errors.get("adk"):
@@ -245,19 +250,18 @@ elif fresh_status == "STALE":
 else:
     chips.append(badge(f"{label}: unknown", "gray"))
 
-chips.append(badge("LLM: Gemini", "green"))
+chips.append(badge("AI Model: Google Gemini", "green"))
 st.markdown(" ".join(chips), unsafe_allow_html=True)
 
 # ---------- GRID LAYOUT ----------
 col_left, col_mid, col_map = st.columns([0.9, 1.1, 1.6], gap="large")
 
 with col_left:
-    st.subheader("Risk")
+    st.subheader("Risk -")
     active = bool(advisory.get("active", True))
     if not active:
         st.info("No active hurricane. Watcher is paused for this ZIP.")
-        st.stop()
-    if analysis:
+    elif analysis:
         if analysis.get("risk") == "ERROR":
             st.error(analysis.get("reason", "Unknown ZIP — cannot assess risk."))
         else:
@@ -276,33 +280,15 @@ with col_left:
                 bullets.append(f"- **Advisory area:** {where} (radius ≈ {float(radius_km):.1f} km)")
             st.markdown("\n".join(bullets))
 
-            # AI-only explainer with robust fallback to the model's raw JSON
-            # AI explainer (prefer explicit field, then debug->risk_obj.why)
+            # AI explainer
             why = result.get("analysis_explainer") or result.get("risk_explainer")
-            if not (isinstance(why, str) and why.strip()):
-                dbg = result.get("debug") or {}
-                robj = dbg.get("risk_obj") or {}
-                if isinstance(robj, dict):
-                    w2 = robj.get("why")
-                    if isinstance(w2, str) and w2.strip():
-                        why = w2
-
-                if isinstance(robj, dict):
-                    candidate = str(robj.get("why", "")).strip()
-                    if candidate:
-                        why = candidate
-
             if isinstance(why, str) and why.strip():
-                st.markdown(f"**Why (AI):** {why}")
-            else:
-                st.caption("AI explanation unavailable.")
-
-
+                st.markdown(f"**Why:** {why}")
     else:
         st.info("Risk analysis unavailable.")
 
 with col_mid:
-    st.subheader("Checklist (Risk-aware)")
+    st.subheader("Storm Prep Checklist -")
     if analysis.get("risk") == "ERROR":
         st.info("Checklist is hidden because the ZIP is invalid/unknown.")
     elif checklist:
@@ -319,7 +305,7 @@ with col_mid:
 
 with col_map:
     if show_map:
-        st.subheader("Map")
+        st.subheader("Map - ")
         if analysis.get("risk") == "ERROR":
             st.info("Map is hidden because the ZIP is invalid/unknown.")
         else:
@@ -376,11 +362,11 @@ with col_map:
 
 left_span, _ = st.columns([2.0, 1.6], gap="large")
 with left_span:
-    st.subheader("Route")
+    st.subheader("Route -")
     if analysis.get("risk") == "ERROR":
         st.info("Route is not available because the ZIP is invalid/unknown.")
     elif plan:
-        st.success(f"Nearest open shelter: {plan['name']} ({plan['distance_km']:.1f} km, {plan['eta_min']} min)")
+        st.success(f"Nearest open shelter: {plan['name']} ({plan['distance_km']:.1f} km, {plan['eta_min']} ETA)")
         params = {"api": 1, "destination": f"{plan['lat']},{plan['lon']}"}
         maps_url = "https://www.google.com/maps/dir/?" + urlencode(params)
         st.markdown(f"[Open route in Google Maps]({maps_url})")
@@ -391,7 +377,7 @@ st.markdown("")  # spacer
 
 # ========== AI Rumor Check (FORM-BASED, ATOMIC SUBMIT) ==========
 if show_verifier:
-    st.subheader("AI Rumor Check")
+    st.subheader("Gemini Rumor Check -")
     if analysis.get("risk") == "ERROR":
         st.info("Verifier is disabled because the ZIP is invalid/unknown.")
     else:
@@ -408,18 +394,18 @@ if show_verifier:
             st.session_state[LLM_TEXT_KEY] = ""
             st.session_state.pop(LLM_PENDING_CLR, None)
 
-        st.caption("Enter statements or rumors to verify with the LLM (one per line).")
+        st.caption("Write a rumor and Google Gemini will fact-check it, labeling each as True, False, or Misleading with a brief note.")
 
         with st.form(APP_FORM_KEY, clear_on_submit=False):
             llm_text = st.text_area(
-                "Rumor(s) to verify",
+                "Enter Rumor(s):",
                 value=st.session_state.get(LLM_TEXT_KEY, ""),
                 key=LLM_TEXT_KEY,
-                help="Examples: 'drink seawater' (False), 'drink water' (True), 'taping windows' (Misleading).",
+                help="Example: Boil tap water after a flood’ (True); ‘Tape windows before a hurricane’ (Misleading);",
             )
-            colA, colB, _ = st.columns([1, 1, 6])
+            colA, colB, _ = st.columns([1, 1, 7])
             with colA:
-                submit_check = st.form_submit_button("Check with LLM")
+                submit_check = st.form_submit_button("Check with Gemini")
             with colB:
                 submit_clear = st.form_submit_button("Clear")
 
@@ -489,11 +475,9 @@ if show_verifier:
                     st.markdown(f"- **Rumor:** {m['pattern']} — {note}")
 
 # Collapsibles
-with st.expander("Advisory (details)", expanded=False):
+with st.expander("Storm Details (.json)", expanded=False):
     if advisory:
         st.json(advisory)
-        dbg = result.get("debug") or {}
-        ui_path = os.path.join(ROOT, "data", "sample_advisory.json")
     else:
         st.caption("No advisory data.")
 
@@ -510,68 +494,8 @@ with st.expander("Agent Status", expanded=False):
         f"Analyzer: {_fmt_ms(timings.get('watcher_ms_analyze'))} ms" + (f" | ERROR: {errors['analyzer']}" if 'analyzer' in errors else ""),
         f"Planner:  {_fmt_ms(timings.get('planner_ms'))} ms"  + (f" | ERROR: {errors['planner']}" if 'planner' in errors else ""),
         f"Parallel: {_fmt_ms(timings.get('parallel_ms'))} ms",
-        f"Total:    {_fmt_ms(timings.get('total_ms'))} ms (ran at {st.session_state.get('last_run', '—')})",
+        f"Total (phases): {_fmt_ms(timings.get('total_ms'))} ms (ran at {st.session_state.get('last_run', '—')})",
     ]
-    if 'explainer_ms' in timings:
-        status_lines.insert(1, f"Explainer: {_fmt_ms(timings.get('explainer_ms'))} ms")
+    if 'end_to_end_ms' in timings:
+        status_lines.append(f"End-to-end: {_fmt_ms(timings.get('end_to_end_ms'))} ms")
     st.code("\n".join(status_lines), language="text")
-
-with st.expander("Advisory (details)", expanded=False):
-    if advisory:
-        st.json(advisory)
-
-        # NEW: show exactly what the watcher parsed from JSON
-        advisory_raw = result.get("advisory_raw")
-        if advisory_raw is not None:
-            st.caption("Raw advisory as parsed:")
-            st.json(advisory_raw)
-
-        # NEW: show exact on-disk file contents (first 1000 chars)
-        ui_path = os.path.join(ROOT, "data", "sample_advisory.json")
-        try:
-            with open(ui_path, "r", encoding="utf-8") as f:
-                raw_text_preview = f.read(1000)
-            st.caption("On-disk file preview (first 1000 chars):")
-            st.code(raw_text_preview, language="json")
-        except Exception as e:
-            st.caption(f"Could not read file preview: {e}")
-
-        # Existing debug lines…
-        dbg = result.get("debug") or {}
-        wpath = dbg.get("advisory_path")
-        wsha  = dbg.get("advisory_sha256")
-        st.caption(f"UI file:  {ui_path}")
-        if wpath:
-            st.caption(f"Watcher file: {wpath}")
-        if wsha:
-            st.caption(f"Watcher content hash (sha256, first 12): {wsha[:12]}")
-
-        # NEW: show radius source + raw value
-        src = dbg.get("advisory_radius_source")
-        raw_val = dbg.get("advisory_radius_raw_value")
-        if src:
-            st.caption(f"radius_km source: {src} (raw value: {raw_val})")
-
-        # Keep your mtime/hash/freshness lines…
-        path = ui_path
-        st.caption(f"File: {path}")
-        try:
-            st.caption(f"Last modified: {datetime.fromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d %H:%M:%S')}")
-        except Exception:
-            pass
-        sig = st.session_state.get(f"{APP_NS}_adv_sig")
-        if sig:
-            st.caption(f"Content hash (sha256, first 12): {sig[:12]}")
-
-        # Show the exact prompt the AI used (you already have this)
-        if dbg.get("explainer_prompt"):
-            st.caption("Explainer prompt (exact):")
-            st.code(dbg["explainer_prompt"], language="text")
-    else:
-        st.caption("No advisory data.")
-
-dbg = result.get("debug") or {}
-raw_ai = dbg.get("risk_raw")
-if raw_ai:
-    st.caption("AI raw (risk_raw):")
-    st.code(str(raw_ai), language="json")

@@ -2,28 +2,82 @@
 from __future__ import annotations
 
 import json
-import math
 import os
+import math
 import time
 import hashlib
-from typing import Any, Dict, Optional, Tuple
+import secrets
+from typing import Dict, Any, Tuple, Optional
 
-# --- ADK helper (required). If missing, UI should surface ADKNotAvailable.
-try:
-    from core.adk_helpers import run_llm_agent_text_debug
-except Exception as e:
-    from core.parallel_exec import ADKNotAvailable
-    raise ADKNotAvailable(f"Google ADK helper missing: {e}")
-
-# --- Build a tiny LLM agent locally
+# ADK + GENAI
 from google.adk.agents import LlmAgent
-try:
-    from google.genai import types  # optional for generation config
-except Exception:
-    types = None  # fall back to default config if unavailable
+from google.genai import types  # type: ignore
 
-# --- Preferred ZIP resolver if your project provides it
+# Project helpers
+from core.adk_helpers import run_llm_agent_text_debug
+
+# ---------------- Constants ----------------
+# IDs for ADK session/runner
+APP_NAME = "HurriAid"
+USER_ID  = os.getenv("ADK_USER_ID", "local_user")   # <— add this line
+DEFAULT_MODEL_ID = os.getenv("ADK_MODEL_ID", "gemini-2.0-flash")
+
+
+RISK_INSTRUCTION = """\
+You are a hurricane risk classifier. Output ONLY strict JSON like:
+{{"risk":"SAFE|LOW|MEDIUM|HIGH","why":"<one concise sentence>","proof":"{proof}"}}
+
+Definitions:
+- SAFE: advisory inactive OR distance_km > radius_km + 200 OR (distance_km > 300 AND category in [TS, CAT1]).
+- LOW: outside the advisory and not close; monitor only.
+- MEDIUM: within (radius_km + 120) OR inside the advisory at TS/CAT1.
+- HIGH: inside advisory radius OR within 50 km at CAT2+.
+
+Style:
+- Use clear, human language (friendly, not robotic).
+- ONE sentence (≤ 25 words).
+- No emojis, no prefixes, no markdown.
+
+Rules:
+- Return ONLY JSON (no extra text).
+- The "proof" value MUST be exactly "{proof}".
+
+Examples:
+
+INPUT
+zip=33101 distance_km=1.3 radius_km=50.0 category=TS active=true
+OUTPUT
+{{"risk":"HIGH","why":"You’re very close to a tropical storm’s center, so conditions can worsen quickly.","proof":"{proof}"}}
+
+INPUT
+zip=94105 distance_km=620.0 radius_km=80.0 category=CAT1 active=true
+OUTPUT
+{{"risk":"SAFE","why":"You are far from the storm and well outside any likely impact area.","proof":"{proof}"}}
+
+Facts for this case:
+- zip: {zip}
+- distance_km: {distance_km}
+- radius_km: {radius_km}
+- category: {category}
+- active: {active}
+"""
+
+# ---------------- ZIP → lat/lon ----------------
+try:
+    import pgeocode  # pip install pgeocode
+    PGEOCODE_AVAILABLE = True
+except Exception:
+    PGEOCODE_AVAILABLE = False
+
+_geocoder = None
+def _get_geocoder():
+    global _geocoder
+    if _geocoder is None and PGEOCODE_AVAILABLE:
+        _geocoder = pgeocode.Nominatim("us")
+    return _geocoder
+
 def _resolve_zip_from_helper(zip_code: str) -> Optional[Tuple[float, float]]:
+    """Optional project helper (if present)."""
     try:
         from tools.zip_resolver import resolve_zip_latlon
         lat, lon = resolve_zip_latlon(zip_code)
@@ -33,58 +87,48 @@ def _resolve_zip_from_helper(zip_code: str) -> Optional[Tuple[float, float]]:
     except Exception:
         return None
 
-# --- pgeocode fallback (project uses pgeocode)
-PGEOCODE_AVAILABLE = False
-try:
-    import pgeocode
-    _NOMI = pgeocode.Nominatim("us")
-    PGEOCODE_AVAILABLE = True
-except Exception:
-    _NOMI = None
-    PGEOCODE_AVAILABLE = False
-
-
-def _resolve_zip_latlon(zip_code: str) -> Optional[Tuple[float, float]]:
+def resolve_zip_latlon(zip_code: str) -> Optional[Tuple[float, float]]:
     """
-    Resolve a US ZIP to (lat, lon).
-    Prefer tools.zip_resolver if present; else use pgeocode.
+    Public resolver exported for other modules.
+    Tries project helper then pgeocode.
     """
     coords = _resolve_zip_from_helper(zip_code)
-    if coords:
+    if coords is not None:
         return coords
-    if not PGEOCODE_AVAILABLE or _NOMI is None:
+    if not PGEOCODE_AVAILABLE:
         return None
     try:
-        rec = _NOMI.query_postal_code(str(zip_code))
-        lat = float(rec["latitude"])
-        lon = float(rec["longitude"])
+        nomi = _get_geocoder()
+        rec = nomi.query_postal_code(str(zip_code))
+        lat, lon = float(rec["latitude"]), float(rec["longitude"])
         if math.isnan(lat) or math.isnan(lon):
             return None
         return lat, lon
     except Exception:
         return None
 
-
-# --- File & math helpers
-def _load_json_utf8sig(path: str) -> Dict[str, Any]:
-    """Load JSON using utf-8-sig to tolerate BOM."""
-    with open(path, "r", encoding="utf-8-sig") as f:
-        return json.load(f)
-
-def _sha256_hex(path: str) -> Optional[str]:
-    try:
-        with open(path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-    except Exception:
-        return None
-
+# ---------------- Utility ----------------
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlmb = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb / 2) ** 2
+    a = math.sin(dphi / 2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb / 2)**2
     return 2 * R * math.asin(math.sqrt(a))
+
+def _load_json_with_bom(path: str) -> Dict[str, Any]:
+    """
+    Load JSON, tolerating BOM by using utf-8-sig.
+    """
+    with open(path, "r", encoding="utf-8-sig") as f:
+        return json.load(f)
+
+def _sha256_file(path: str) -> Optional[str]:
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except Exception:
+        return None
 
 def _fmt_watch_text(zip_code: str, risk: str, dist_km: float, inside: bool, radius_km: float) -> str:
     where = "Inside" if inside else "Outside"
@@ -95,246 +139,201 @@ def _fmt_watch_text(zip_code: str, risk: str, dist_km: float, inside: bool, radi
         f"Advisory area: {where} (radius ≈ {float(radius_km):.1f} km)"
     )
 
-def _strip_code_fences(s: str) -> str:
-    s = s.strip()
-    if s.startswith("```"):
-        lines = s.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]
-        s = "\n".join(lines).strip()
-    return s
-
-
-# --- Advisory read/normalize
-def _read_advisory(data_dir: str) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]:
-    """
-    Returns (advisory_norm, debug_info, advisory_raw_or_none)
-    advisory_norm keys: center{lat,lon}, radius_km, category, issued_at, active
-    """
-    path = os.path.join(data_dir, "sample_advisory.json")
-    dbg: Dict[str, Any] = {
-        "advisory_path": path,
-        "advisory_sha256": _sha256_hex(path),
-    }
-
-    raw: Optional[Dict[str, Any]] = None
+def _json_from_text(t: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not t or not isinstance(t, str):
+        return None
     try:
-        raw = _load_json_utf8sig(path)
-        center = raw.get("center") or {}
-        adv = {
-            "center": {"lat": float(center.get("lat", 25.77)), "lon": float(center.get("lon", -80.19))},
-            "radius_km": float(raw.get("radius_km", 100.0)),
-            "category": str(raw.get("category", "TS")),
-            "issued_at": str(raw.get("issued_at", "")),
-            "active": bool(raw.get("active", True)),
-        }
-        dbg["advisory_radius_source"] = "file"
-        dbg["advisory_radius_raw_value"] = raw.get("radius_km", None)
-        return adv, dbg, raw
-    except Exception as e:
-        dbg["advisory_error"] = f"Advisory invalid: {e}"
-        # Return a safe inactive default; UI will show No active hurricane.
-        adv = {
-            "center": {"lat": 25.77, "lon": -80.19},
-            "radius_km": 100.0,
-            "category": "TS",
-            "issued_at": "",
-            "active": False,
-        }
-        return adv, dbg, raw
+        return json.loads(t)
+    except Exception:
+        return None
 
+# ---------------- AI Risk Classifier ----------------
+def _ai_classify_risk(
+    *,
+    zip_code: str,
+    distance_km: float,
+    radius_km: float,
+    category: str,
+    active: bool,
+    session_id: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Calls an LLM to classify risk and explain 'why'.
+    Returns (obj, debug) where obj has keys: risk, why, proof.
+    Raises RuntimeError on failure so caller can surface a clear UI error.
+    """
+    proof = secrets.token_hex(3)  # a short per-call token
 
-# --- AI prompt (JSON only; escape braces for .format)
-RISK_INSTRUCTION = (
-    "You are a hurricane risk classifier and explainer.\n"
-    "Return JSON ONLY on one line: "
-    "{{\"risk\":\"LOW|MEDIUM|HIGH\",\"why\":\"<1–2 sentences, 20–45 words, clear and relatable>\"}}\n"
-    "\n"
-    "Style rules:\n"
-    "- Sound natural and empathetic, not robotic.\n"
-    "- Use concrete details from the facts (distance, radius, category).\n"
-    "- No emojis, no prefixes, no markdown, no extra keys.\n"
-    "- Do NOT invent places/people; stick strictly to the facts provided.\n"
-    "\n"
-    "Good examples:\n"
-    "Input facts: zip=33101, category=TS, radius_km=50, distance_km=12.4, inside_radius=TRUE\n"
-    "Output: {{\"risk\":\"MEDIUM\",\"why\":\"You’re inside the 50-km advisory zone and close to the storm’s center, so gusty squalls and brief power flickers are possible as bands move through.\"}}\n"
-    "\n"
-    "Input facts: zip=32226, category=CAT2, radius_km=80, distance_km=140.0, inside_radius=FALSE\n"
-    "Output: {{\"risk\":\"LOW\",\"why\":\"You’re outside the advisory radius and roughly 140 km from the center. Expect periods of rain and breezes, but damaging winds are unlikely at this distance.\"}}\n"
-    "\n"
-    "Facts:\n"
-    "- zip: {zip}\n"
-    "- category: {category}\n"
-    "- radius_km: {radius_km}\n"
-    "- distance_km: {distance_km}\n"
-    "- inside_radius: {inside}\n"
-)
-
-def _make_risk_agent() -> LlmAgent:
-    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-
-    gen_cfg = None
-    if types is not None:
-        try:
-            gen_cfg = types.GenerateContentConfig(
-                temperature=0.65,      # a bit more expressive
-                top_p=0.9,             # allow more varied wording
-                max_output_tokens=180, # room for 1–2 sentences
-            )
-        except Exception:
-            gen_cfg = None
-
-    return LlmAgent(
+    agent = LlmAgent(
+        model=DEFAULT_MODEL_ID,
         name="RiskClassifier",
-        model=model,
         include_contents="none",
-        instruction="Follow the caller’s instructions exactly; respond ONLY as specified.",
-        generate_content_config=gen_cfg,
         disallow_transfer_to_parent=True,
         disallow_transfer_to_peers=True,
+        generate_content_config=types.GenerateContentConfig(  # type: ignore
+            temperature=0.6,  # slightly expressive
+            max_output_tokens=160,
+            response_mime_type="application/json",
+        ),
     )
 
-def _ai_classify_risk(
-    zip_code: str,
-    category: str,
-    radius_km: float,
-    distance_km: float,
-    inside: bool
-) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Calls the LLM via ADK helper. Returns (parsed_json_or_None, debug_dict).
-    """
     prompt = RISK_INSTRUCTION.format(
         zip=zip_code,
-        category=str(category),
-        radius_km=str(float(radius_km)),
-        distance_km=f"{distance_km:.1f}",
-        inside=str(bool(inside)).upper(),
+        distance_km=distance_km,
+        radius_km=radius_km,
+        category=category,
+        active=str(bool(active)).lower(),
+        proof=proof,
     )
 
-    agent = _make_risk_agent()
-
-    # pass BOTH app_name and agent so ADK Runner can initialize
-    text, events, err = run_llm_agent_text_debug(
-        agent=agent,
-        prompt=prompt,
-        app_name="hurri_watch",
-        user_id="ui",
-        session_id=f"sess_risk_{zip_code}",
-    )
-
-    debug = {
+    dbg: Dict[str, Any] = {
         "explainer_prompt": prompt,
-        "risk_events": events or [],
-        "risk_error": err,
-        "risk_raw": text,
+        "attempts": [],
+        "proof": proof,
     }
 
-    if err or text is None:
-        return None, debug
+    def _call(tag: str, pr: str) -> Tuple[Optional[str], Any, Optional[str]]:
+        text, events, err = run_llm_agent_text_debug(
+            app_name=APP_NAME,
+            user_id=USER_ID,          # <— add this
+            session_id=session_id,
+            agent=agent,
+            prompt=pr,
+        )
 
-    # Strip code fences if any and parse JSON
-    try:
-        if isinstance(text, dict):
-            obj = text
-        else:
-            obj = json.loads(_strip_code_fences(str(text)))
-    except Exception as e:
-        debug["risk_parse_error"] = f"JSON parse failed: {e}"
-        obj = None
+        dbg["attempts"].append({"tag": tag, "err": f"{err}" if err else None, "text": text})
+        return text, events, err
 
-    return obj, debug
+    # try once
+    text1, _, _ = _call("first", prompt)
+    obj = _json_from_text(text1)
 
+    # retry with explicit nudge if needed
+    if obj is None:
+        text2, _, _ = _call("retry", prompt + "\nReturn ONLY the JSON object now. No prose.")
+        obj = _json_from_text(text2)
 
-# --- Public entry point used by Coordinator
+    if not obj:
+        raise RuntimeError("empty model text")
+
+    # validate keys + proof
+    if "risk" not in obj or "why" not in obj or "proof" not in obj:
+        raise RuntimeError('missing keys in AI JSON (expected "risk","why","proof")')
+
+    if str(obj.get("proof", "")).strip() != proof:
+        raise RuntimeError("AI JSON missing/invalid proof")
+
+    obj["risk"] = str(obj["risk"]).upper().strip()
+    return obj, dbg
+
+# ---------------- Public entry: one-shot watcher ----------------
 def run_watcher_once(data_dir: str, zip_code: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    One-shot run for Streamlit. Produces a state dict for the UI.
-    AI-only: if the LLM output is invalid, we return ERROR (no heuristic fallback).
+    Streamlit-friendly one-iteration run.
+    Produces a dict 'state' with advisory, analysis, risk_explainer, watcher_text, debug, timings_ms, etc.
     """
-    t0 = time.perf_counter()
-    state: Dict[str, Any] = {"debug": {}, "errors": {}, "timings_ms": {}}
+    t0_total = time.perf_counter()
+    state: Dict[str, Any] = {"debug": {}, "timings_ms": {}}
     timings = state["timings_ms"]
-    debug = state["debug"]
 
-    # 1) Advisory
-    t_read = time.perf_counter()
-    advisory, adv_dbg, adv_raw = _read_advisory(data_dir)
-    timings["watcher_ms_read"] = (time.perf_counter() - t_read) * 1000.0
-    state["advisory"] = advisory
-    state["active"] = bool(advisory.get("active", True))
-    if adv_raw is not None:
-        state["advisory_raw"] = adv_raw
-    debug.update(adv_dbg)
-
-    # Stop early if inactive; UI shows the "No active hurricane" banner.
-    if not state["active"]:
-        state["analysis"] = {"risk": "SAFE"}
-        timings["watcher_ms_total"] = (time.perf_counter() - t0) * 1000.0
+    # 1) Load advisory
+    adv_path = os.path.join(data_dir, "sample_advisory.json")
+    t0 = time.perf_counter()
+    try:
+        advisory_raw = _load_json_with_bom(adv_path)
+        sha = _sha256_file(adv_path)
+        state["debug"]["advisory_path"] = adv_path
+        if sha:
+            state["debug"]["advisory_sha256"] = sha
+    except Exception as e:
+        state["analysis"] = {"risk": "ERROR", "reason": f"Advisory invalid: {e}"}
+        timings["watcher_ms_total"] = (time.perf_counter() - t0_total) * 1000.0
+        state["advisory"] = {}
         return state, timings
 
-    # 2) ZIP -> lat/lon
-    coords = _resolve_zip_latlon(zip_code)
+    # normalize advisory
+    center = advisory_raw.get("center") or {}
+    adv = {
+        "center": {"lat": float(center.get("lat", 25.77)), "lon": float(center.get("lon", -80.19))},
+        "radius_km": float(advisory_raw.get("radius_km", 100.0)),
+        "category": str(advisory_raw.get("category", "TS")),
+        "issued_at": advisory_raw.get("issued_at", ""),
+        "active": bool(advisory_raw.get("active", True)),
+    }
+    state["advisory_raw"] = advisory_raw  # for UI debugging
+    state["advisory"] = adv
+    timings["watcher_ms_read"] = (time.perf_counter() - t0) * 1000.0
+
+    # 2) If inactive -> stop (UI shows paused)
+    if not adv["active"]:
+        state["analysis"] = {"risk": "SAFE", "distance_km": None}
+        state["risk_explainer"] = "Advisory is inactive for this area."
+        timings["watcher_ms_total"] = (time.perf_counter() - t0_total) * 1000.0
+        return state, timings
+
+    # 3) ZIP → lat/lon
+    t0 = time.perf_counter()
+    coords = resolve_zip_latlon(zip_code)
     if coords is None:
-        reason = "pgeocode not installed" if not PGEOCODE_AVAILABLE else f"Unknown ZIP {zip_code}"
+        reason = "pgeocode not installed or unknown ZIP"
         state["analysis"] = {"risk": "ERROR", "reason": reason}
-        timings["watcher_ms_total"] = (time.perf_counter() - t0) * 1000.0
+        timings["watcher_ms_analyze"] = (time.perf_counter() - t0) * 1000.0
+        timings["watcher_ms_total"] = (time.perf_counter() - t0_total) * 1000.0
         return state, timings
 
     zlat, zlon = coords
     state["zip_point"] = {"lat": zlat, "lon": zlon}
 
-    # 3) Distance/inside
-    clat = float(advisory["center"]["lat"])
-    clon = float(advisory["center"]["lon"])
-    radius_km = float(advisory["radius_km"])
-    category = str(advisory.get("category", "TS"))
+    clat, clon = float(adv["center"]["lat"]), float(adv["center"]["lon"])
     dist_km = _haversine_km(zlat, zlon, clat, clon)
+    radius_km = float(adv["radius_km"])
     inside = dist_km <= radius_km
+    timings["watcher_ms_analyze"] = (time.perf_counter() - t0) * 1000.0
 
-    # 4) Ask AI for risk + why (JSON)
-    t_ai = time.perf_counter()
-    obj, ai_dbg = _ai_classify_risk(
-        zip_code=zip_code,
-        category=category,
-        radius_km=radius_km,
-        distance_km=dist_km,
-        inside=inside,
-    )
-    timings["watcher_ms_analyze"] = (time.perf_counter() - t_ai) * 1000.0
-    debug.update(ai_dbg)
+    # 4) AI: risk + why
+    t0 = time.perf_counter()
+    ai_err = None
+    ai_dbg: Dict[str, Any] = {}
+    try:
+        obj, ai_dbg = _ai_classify_risk(
+            zip_code=zip_code,
+            distance_km=round(dist_km, 1),
+            radius_km=radius_km,
+            category=str(adv.get("category", "")),
+            active=bool(adv.get("active", True)),
+            session_id=f"sess_risk_{zip_code}",
+        )
+        risk = obj["risk"]
+        why = str(obj.get("why", "")).strip()
+        state["debug"]["risk_ai_verified"] = True
+        state["risk_explainer"] = why  # <- UI shows this as "Why (AI)"
+        state["debug"]["risk_raw"] = obj
+    except Exception as e:
+        ai_err = f"{e}"
+        state["debug"]["risk_ai_verified"] = False
+        state["risk_explainer"] = None
+        state["debug"]["risk_raw"] = None
 
-    if not obj:
-        state["analysis"] = {"risk": "ERROR", "reason": ai_dbg.get("risk_error") or ai_dbg.get("risk_parse_error") or "NO_TEXT"}
-        timings["watcher_ms_total"] = (time.perf_counter() - t0) * 1000.0
+        # surface the error in analysis.reason so UI can show it under Risk
+        state["analysis"] = {"risk": "ERROR", "reason": f"AI risk failed: {ai_err}"}
+        timings["watcher_ms_explainer"] = (time.perf_counter() - t0) * 1000.0
+        timings["watcher_ms"] = timings.get("watcher_ms_read", 0.0) + timings.get("watcher_ms_analyze", 0.0)
+        timings["watcher_ms_total"] = (time.perf_counter() - t0_total) * 1000.0
+        # also include debug attempts/prompt
+        state["debug"]["risk_ai"] = ai_dbg
         return state, timings
 
-    risk = str(obj.get("risk", "")).upper().strip()
-    why = str(obj.get("why", "")).strip()
+    timings["watcher_ms_explainer"] = (time.perf_counter() - t0) * 1000.0
+    state["debug"]["risk_ai"] = ai_dbg
 
-    # AI-only: if invalid, error out (no heuristic fallback)
-    if risk not in ("LOW", "MEDIUM", "HIGH") or not why:
-        state["analysis"] = {"risk": "ERROR", "reason": "AI risk parse failed: missing/invalid `risk` or `why`"}
-        timings["watcher_ms_total"] = (time.perf_counter() - t0) * 1000.0
-        return state, timings
-
-    # 5) Persist outputs for UI
+    # 5) Finalize analysis using AI-provided risk
     state["analysis"] = {"risk": risk, "distance_km": round(dist_km, 1)}
-    state["risk_explainer"] = why
+
+    # 6) Watcher text block
     state["watcher_text"] = _fmt_watch_text(zip_code, risk, dist_km, inside, radius_km)
 
-    # Debug visibility
-    debug["risk_obj"] = obj
-    debug["watcher_impl"] = "ai-risk-v5"
-
-    # Timings total
+    # 7) Total timings
     timings["watcher_ms"] = timings.get("watcher_ms_read", 0.0) + timings.get("watcher_ms_analyze", 0.0)
-    timings["watcher_ms_total"] = (time.perf_counter() - t0) * 1000.0
+    timings["watcher_ms_total"] = (time.perf_counter() - t0_total) * 1000.0
+
     return state, timings
-
-
-# --- Back-compat for older imports (parallel_pipeline, etc.)
-_PGEOCODE_AVAILABLE = PGEOCODE_AVAILABLE
